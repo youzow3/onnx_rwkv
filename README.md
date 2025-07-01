@@ -4,12 +4,14 @@ ONNX-RWKV is a project to make RWKV series ONNX implementation. Since I started 
 
 ## Supported Data Types
 
-Fully fp32 only. I want to implement bf16, and fp16/fp32 mixed too.
+* fp32
+* fp16/fp32 mixed
+* bf16
 
 ## NOTE
 
 I used Python 3.12 for this script.
 
-Lots of implementation problem exists. Because of this, I checked only RWKV-7 G1 0.1b (and it worked).
+Lots of implementation problem exists. Because of this, I checked only RWKV-7 G1 with fp32 on CPU. 0.1b, 1.5b, and 2.9b are worked with cli-chat.
 
 Example code in C is available at cli-chat/.
