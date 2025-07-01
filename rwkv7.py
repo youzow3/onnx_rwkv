@@ -3,6 +3,8 @@ import numpy as np
 import torch
 import argparse
 
+import pathlib
+
 
 __domain: str = "rwkv7"
 __opset_imports: list[onnx.OperatorSetIdProto] = [
@@ -51,13 +53,16 @@ def make_time_shift() -> onnx.FunctionProto:
             onnx.helper.make_node("Constant", [], ["one"], value_ints=[1]),
             onnx.helper.make_node("Constant", [], ["two"], value_ints=[2]),
             onnx.helper.make_node("Constant", [], ["three"], value_ints=[3]),
-            onnx.helper.make_node("Constant", [], ["max"], value_ints=[np.iinfo(np.int64).max]),
+            onnx.helper.make_node(
+                "Constant", [], ["max"], value_ints=[np.iinfo(np.int64).max]),
             onnx.helper.make_node("Constant", [], ["x_end"], value_ints=[-1]),
             onnx.helper.make_node("Constant", [], ["T_axes"], value_ints=[1])]
     broadcast: list[onnx.NodeProto] = [
             onnx.helper.make_node("Shape", ["x"], ["x_shape"]),
-            onnx.helper.make_node("Slice", ["x_shape", "zero", "one", "zero"], ["B"]),
-            onnx.helper.make_node("Slice", ["x_shape", "two", "three", "zero"], ["C"]),
+            onnx.helper.make_node(
+                "Slice", ["x_shape", "zero", "one", "zero"], ["B"]),
+            onnx.helper.make_node(
+                "Slice", ["x_shape", "two", "three", "zero"], ["C"]),
             onnx.helper.make_node(
                 "Concat", ["B", "one", "C"], ["expand_shape"], axis=0),
             onnx.helper.make_node(
@@ -67,7 +72,8 @@ def make_time_shift() -> onnx.FunctionProto:
                 "Slice", ["x", "zero", "x_end", "T_axes"], ["x_shift_"]),
             onnx.helper.make_node(
                 "Concat", ["x_last", "x_shift_"], ["x_shift"], axis=1)]
-    x_next: onnx.NodeProto = onnx.helper.make_node("Slice", ["x", "x_end", "max", "T_axes"], ["x_next"])
+    x_next: onnx.NodeProto = onnx.helper.make_node(
+            "Slice", ["x", "x_end", "max", "T_axes"], ["x_next"])
 
     return onnx.helper.make_function(
             __domain, "time_shift", ["x", "x_last_"], ["x_shift", "x_next"],
@@ -127,24 +133,24 @@ def make_loramlp() -> list[onnx.FunctionProto]:
             ]
 
 
-def make_wkv7() -> onnx.FunctionProto:
+def make_wkv7(dtype: int) -> onnx.FunctionProto:
     #
     # WKV Operation
     #
     wkv_state_value_info: onnx.ValueInfoProto
     wkv_state_value_info = onnx.helper.make_tensor_value_info(
-            "wkv_state", onnx.TensorProto.FLOAT, ["B", "H", "N", "N"])
+            "wkv_state", dtype, ["B", "H", "N", "N"])
     w_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
-            "w", onnx.TensorProto.FLOAT, ["B", "H", "N"])
+            "w", dtype, ["B", "H", "N"])
     ab_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
-            "ab", onnx.TensorProto.FLOAT, ["B", "H", "N", "N"])
+            "ab", dtype, ["B", "H", "N", "N"])
     vk_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
-            "vk", onnx.TensorProto.FLOAT, ["B", "H", "N", "N"])
+            "vk", dtype, ["B", "H", "N", "N"])
 
     wkv_next_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
-            "wkv_next", onnx.TensorProto.FLOAT, ["B", "H", "N", "N"])
+            "wkv_next", dtype, ["B", "H", "N", "N"])
     wkv_out_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
-            "wkv_out", onnx.TensorProto.FLOAT, ["B", "H", "N", "N"])
+            "wkv_out", dtype, ["B", "H", "N", "N"])
 
     diag_w_unsqueeze: onnx.NodeProto = onnx.helper.make_node(
             "Constant", [], ["diag_w_unsqueeze"], value_ints=[2])
@@ -161,7 +167,8 @@ def make_wkv7() -> onnx.FunctionProto:
             "Identity", ["wkv_next"], ["wkv_out"])
 
     wkv_loop_graph: onnx.GraphProto = onnx.helper.make_graph(
-            [diag_w_unsqueeze, diag_w, wkv_w, wkv_ab] + wkv_next + [wkv_out], "wkv_loop",
+            [diag_w_unsqueeze, diag_w, wkv_w, wkv_ab] + wkv_next + [wkv_out],
+            "wkv_loop",
             [wkv_state_value_info, w_value_info, ab_value_info, vk_value_info],
             [wkv_next_value_info, wkv_out_value_info])
 
@@ -193,11 +200,11 @@ def make_wkv7() -> onnx.FunctionProto:
             onnx.helper.make_node("MatMul", ["v_t", "k_t"], ["vk"])]
 
     w_float: onnx.NodeProto = onnx.helper.make_node(
-            "Cast", ["w"], ["w_float"], to=onnx.TensorProto.FLOAT)
+            "Cast", ["w"], ["w_float"], to=dtype)
     ab_float: onnx.NodeProto = onnx.helper.make_node(
-            "Cast", ["ab"], ["ab_float"], to=onnx.TensorProto.FLOAT)
+            "Cast", ["ab"], ["ab_float"], to=dtype)
     vk_float: onnx.NodeProto = onnx.helper.make_node(
-            "Cast", ["vk"], ["vk_float"], to=onnx.TensorProto.FLOAT)
+            "Cast", ["vk"], ["vk_float"], to=dtype)
 
     wkv_loop: onnx.NodeProto = onnx.helper.make_node(
             "Scan", ["wkv_state", "w_float", "ab_float", "vk_float"],
@@ -383,11 +390,14 @@ def make_time_mix(dim: int, head_size: int, dim_att: int
 
 def make_channel_mix(C: int) -> onnx.FunctionProto:
     time_shift: onnx.NodeProto = onnx.helper.make_node(
-            "time_shift", ["x", "x_last"], ["x_shift", "x_last_next"], domain=__domain)
+            "time_shift", ["x", "x_last"],
+            ["x_shift", "x_last_next"], domain=__domain)
     lerp: onnx.NodeProto = onnx.helper.make_node(
             "lerp", ["x", "x_shift", "x_k"], ["lerp"], domain=__domain)
-    key_weight_t: onnx.NodeProto = onnx.helper.make_node("Transpose", ["key.weight"], ["key_weight_t"])
-    value_weight_t: onnx.NodeProto = onnx.helper.make_node("Transpose", ["value.weight"], ["value_weight_t"])
+    key_weight_t: onnx.NodeProto = onnx.helper.make_node(
+            "Transpose", ["key.weight"], ["key_weight_t"])
+    value_weight_t: onnx.NodeProto = onnx.helper.make_node(
+            "Transpose", ["value.weight"], ["value_weight_t"])
     k: onnx.NodeProto = onnx.helper.make_node(
             "MatMul", ["lerp", "key_weight_t"], ["k"])
     relu: onnx.NodeProto = onnx.helper.make_node("Relu", ["k"], ["relu"])
@@ -399,7 +409,8 @@ def make_channel_mix(C: int) -> onnx.FunctionProto:
             __domain, "channel_mix",
             ["x", "x_last", "x_k", "key.weight", "value.weight"],
             ["v", "x_last_next"],
-            [time_shift, lerp, key_weight_t, value_weight_t, k, relu, relu2, v], __opset_imports)
+            [time_shift, lerp, key_weight_t,
+             value_weight_t, k, relu, relu2, v], __opset_imports)
 
 
 def make_block() -> list[onnx.FunctionProto]:
@@ -420,7 +431,8 @@ def make_block() -> list[onnx.FunctionProto]:
              "att.g1", "att.g2", "att.k_k", "att.k_a", "att.r_k",
              "att.receptance.weight", "att.key.weight", "att.value.weight",
              "att.output.weight", "att.ln_x.weight", "att.ln_x.bias"],
-            ["emb_tmix", "v_first", "x_tmix_next_", "wkv_next"], domain=__domain)
+            ["emb_tmix", "v_first", "x_tmix_next", "wkv_next"],
+            domain=__domain)
     tmix: onnx.NodeProto = onnx.helper.make_node(
             "time_mix",
             ["emb_ln1", "v_first", "x_tmix_last", "wkv_state",
@@ -430,7 +442,7 @@ def make_block() -> list[onnx.FunctionProto]:
              "att.k_k", "att.k_a", "att.r_k",
              "att.receptance.weight", "att.key.weight", "att.value.weight",
              "att.output.weight", "att.ln_x.weight", "att.ln_x.bias"],
-            ["emb_tmix", "x_tmix_next_", "wkv_next"], domain=__domain)
+            ["emb_tmix", "x_tmix_next", "wkv_next"], domain=__domain)
     tmix_x: onnx.NodeProto = onnx.helper.make_node(
             "Add", ["emb_ln0", "emb_tmix"], ["emb_tmix_x"])
     ln2: onnx.NodeProto = onnx.helper.make_node(
@@ -440,14 +452,9 @@ def make_block() -> list[onnx.FunctionProto]:
             "channel_mix",
             ["emb_tmix_x_ln2", "x_cmix_last",
              "ffn.x_k", "ffn.key.weight", "ffn.value.weight"],
-            ["emb_cmix", "x_cmix_next_"], domain=__domain)
+            ["emb_cmix", "x_cmix_next"], domain=__domain)
     cmix_x: onnx.NodeProto = onnx.helper.make_node(
             "Add", ["emb_tmix_x", "emb_cmix"], ["emb_cmix_tmix_x"])
-
-    x_tmix_next: onnx.NodeProto = onnx.helper.make_node(
-            "Cast", ["x_tmix_next_"], ["x_tmix_next"], to=onnx.TensorProto.FLOAT)
-    x_cmix_next: onnx.NodeProto = onnx.helper.make_node(
-            "Cast", ["x_cmix_next_"], ["x_cmix_next"], to=onnx.TensorProto.FLOAT)
 
     return [
             onnx.helper.make_function(
@@ -464,8 +471,7 @@ def make_block() -> list[onnx.FunctionProto]:
                  "ffn.x_k", "ffn.key.weight", "ffn.value.weight"],
                 ["emb_cmix_tmix_x", "v_first",
                  "x_tmix_next", "wkv_next", "x_cmix_next"],
-                [ln0, ln1, tmix0, tmix_x, ln2, cmix, cmix_x,
-                 x_tmix_next, x_cmix_next], __opset_imports),
+                [ln0, ln1, tmix0, tmix_x, ln2, cmix, cmix_x], __opset_imports),
             onnx.helper.make_function(
                 __domain, "block",
                 ["emb", "v_first", "x_tmix_last", "wkv_state", "x_cmix_last",
@@ -479,17 +485,39 @@ def make_block() -> list[onnx.FunctionProto]:
                  "att.output.weight", "att.ln_x.weight", "att.ln_x.bias",
                  "ffn.x_k", "ffn.key.weight", "ffn.value.weight"],
                 ["emb_cmix_tmix_x", "x_tmix_next", "wkv_next", "x_cmix_next"],
-                [ln0_, ln1, tmix, tmix_x, ln2, cmix, cmix_x,
-                 x_tmix_next, x_cmix_next], __opset_imports)]
+                [ln0_, ln1, tmix, tmix_x, ln2, cmix, cmix_x], __opset_imports)]
 
 
 def make_model_from_state_dict(
-        state_dict: dict[str, torch.Tensor]
+        state_dict: dict[str, torch.Tensor], dtype: str
         ) -> onnx.ModelProto | dict[onnx.ModelProto]:
+    torch_onnx_dtype: dict[torch.dtype, int] = {
+            torch.float: onnx.TensorProto.FLOAT,
+            torch.float16: onnx.TensorProto.FLOAT16,
+            torch.bfloat16: onnx.TensorProto.BFLOAT16}
+    dtype_table: dict[str, torch.dtype] = {
+            "auto": state_dict["emb.weight"].dtype,
+            "fp32": torch.float,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16}
+    np_dtype_table: dict[torch.dtype, np.dtype] = {
+            torch.float: np.float32,
+            torch.float16: np.float16,
+            torch.bfloat16: onnx._custom_element_types.bfloat16
+            }
+    wkv_dtype_table: dict[torch.dtype, int] = {
+            torch.float: onnx.TensorProto.FLOAT,
+            torch.float16: onnx.TensorProto.FLOAT,
+            torch.bfloat16: onnx.TensorProto.BFLOAT16}
+
+    # Get main dtype
+    main_dtype: torch.dtype = dtype_table[dtype]
+    onnx_main_dtype: int = torch_onnx_dtype[main_dtype]
+    onnx_wkv_dtype: int = wkv_dtype_table[main_dtype]
     # Get embedding dimension
     dim: int = state_dict["emb.weight"].shape[1]
-    # Get main dtype
-    main_dtype: torch.dtype = state_dict["emb.weight"].dtype
+    # vocab size
+    vocab_size: int = state_dict["emb.weight"].shape[0]
     # head size
     head_size: int = state_dict["blocks.0.att.r_k"].shape[1]
     n_head: int = dim // head_size
@@ -508,7 +536,7 @@ def make_model_from_state_dict(
     linear_function: onnx.FunctionProto = make_linear()
     lerp_function: onnx.FunctionProto = make_lerp()
     loramlp_functions: list[onnx.FunctionProto] = make_loramlp()
-    wkv7_function: onnx.FunctionProto = make_wkv7()
+    wkv7_function: onnx.FunctionProto = make_wkv7(wkv_dtype_table[main_dtype])
     time_mix_functions: list[onnx.FunctionProto] = make_time_mix(
             dim, head_size, dim)
     channel_mix_function: onnx.FunctionProto = make_channel_mix(dim)
@@ -518,44 +546,48 @@ def make_model_from_state_dict(
     onnx.checker.check_function(time_shift_function)
     onnx.checker.check_function(linear_function)
     onnx.checker.check_function(lerp_function)
-    _ = [onnx.checker.check_function(loramlp_function) for loramlp_function in loramlp_functions]
+    _ = [onnx.checker.check_function(loramlp_function)
+         for loramlp_function in loramlp_functions]
     onnx.checker.check_function(wkv7_function)
-    _ = [onnx.checker.check_function(time_mix_function) for time_mix_function in time_mix_functions]
+    _ = [onnx.checker.check_function(time_mix_function)
+         for time_mix_function in time_mix_functions]
     onnx.checker.check_function(channel_mix_function)
-    _ = [onnx.checker.check_function(block_function) for block_function in block_functions]
+    _ = [onnx.checker.check_function(block_function)
+         for block_function in block_functions]
 
     # Obtain TensorProtos of parameters
     tensor_proto_state_dict: dict[str, onnx.TensorProto] = {}
     parameters: dict[str, onnx.NodeProto] = {}
-    for k, v in state_dict.items():
-        tensor: torch.Tensor = state_dict[k]
+    for k in list(state_dict.keys()):
+        tensor: np.ndarray = state_dict[k].detach(
+                ).cpu().to(torch.float).numpy()
         tensor_proto_state_dict[k] = onnx.numpy_helper.from_array(
-                tensor.detach().cpu().to(torch.float).numpy(), f"{k}")
+                tensor.astype(np_dtype_table[main_dtype]), f"{k}")
 
     # Input/Output value info
     x_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
             "x", onnx.TensorProto.INT64, ["batch", "seq"])
     head_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
-            "head", onnx.TensorProto.FLOAT,
-            ["batch", "seq", state_dict["emb.weight"].shape[0]])
+            "head", onnx_main_dtype,
+            ["batch", "seq", vocab_size])
     state_value_infos: list[onnx.ValueInfoProto] = []
     next_value_infos: list[onnx.ValueInfoProto] = []
 
     for i in range(nlayers):
         state_value_infos.append(onnx.helper.make_tensor_value_info(
-            f"x_tmix_last_{i}", onnx.TensorProto.FLOAT, ["batch", 1, dim]))
+            f"x_tmix_last_{i}", onnx_main_dtype, ["batch", 1, dim]))
         state_value_infos.append(onnx.helper.make_tensor_value_info(
-            f"wkv_state_{i}", onnx.TensorProto.FLOAT,
+            f"wkv_state_{i}", onnx_wkv_dtype,
             ["batch", n_head, head_size, head_size]))
         state_value_infos.append(onnx.helper.make_tensor_value_info(
-            f"x_cmix_last_{i}", onnx.TensorProto.FLOAT, ["batch", 1, dim]))
+            f"x_cmix_last_{i}", onnx_main_dtype, ["batch", 1, dim]))
         next_value_infos.append(onnx.helper.make_tensor_value_info(
-            f"x_tmix_next_{i}", onnx.TensorProto.FLOAT, ["batch", 1, dim]))
+            f"x_tmix_next_{i}", onnx_main_dtype, ["batch", 1, dim]))
         next_value_infos.append(onnx.helper.make_tensor_value_info(
-            f"wkv_next_{i}", onnx.TensorProto.FLOAT,
+            f"wkv_next_{i}", onnx_wkv_dtype,
             ["batch", n_head, head_size, head_size]))
         next_value_infos.append(onnx.helper.make_tensor_value_info(
-            f"x_cmix_next_{i}", onnx.TensorProto.FLOAT, ["batch", 1, dim]))
+            f"x_cmix_next_{i}", onnx_main_dtype, ["batch", 1, dim]))
 
     emb: onnx.NodeProto = onnx.helper.make_node(
             "Gather", ["emb.weight", "x"], ["emb"])
@@ -600,8 +632,8 @@ def make_model_from_state_dict(
              f"blocks.{i}.att.ln_x.weight", f"blocks.{i}.att.ln_x.bias",
              f"blocks.{i}.ffn.x_k",
              f"blocks.{i}.ffn.key.weight", f"blocks.{i}.ffn.value.weight"],
-            [f"emb{i}",
-             f"x_tmix_next_{i}", f"wkv_next_{i}", f"x_cmix_next_{i}"], domain=__domain))
+            [f"emb{i}", f"x_tmix_next_{i}", f"wkv_next_{i}",
+             f"x_cmix_next_{i}"], domain=__domain))
 
     ln_out: onnx.NodeProto = onnx.helper.make_node(
             "LayerNormalization",
@@ -618,31 +650,39 @@ def make_model_from_state_dict(
 
     rwkv_lm_model: onnx.ModelProto = onnx.helper.make_model(
             rwkv_lm, opset_imports=__opset_imports,
-            functions=[normalize_function, time_shift_function, lerp_function, linear_function
-                       ] + loramlp_functions + [wkv7_function]
+            functions=[normalize_function, time_shift_function, lerp_function,
+                       linear_function] + loramlp_functions + [wkv7_function]
             + time_mix_functions +
             [channel_mix_function] + block_functions
             )
 
-    onnx.checker.check_model(rwkv_lm_model, full_check=True)
+    # onnx.checker.check_model(rwkv_lm_model, full_check=True)
 
     return rwkv_lm_model
 
 
 def main():
+    torch.set_default_device("cpu")
+
     parser: argparse.ArgumentParser = argparse.ArgumentParser()
-    parser.add_argument("-v", "--verbose", help="verbose output", action="store_true")
+    parser.add_argument("-v", "--verbose", help="verbose output",
+                        action="store_true")
+    parser.add_argument("-t", "--dtype", help="data type", default="fp32",
+                        choices=["auto", "fp32", "fp16", "bf16"])
     parser.add_argument("pt_file",
                         help="A PyTorch file which contains state dict.")
     parser.add_argument("onnx_file",
                         help="The ONNX file name which will be saved.")
 
     args: argparse.Namespace = parser.parse_args()
-    state_dict: dict[str, torch.Tensor] = torch.load(args.pt_file)
-    model: onnx.ModelProto = make_model_from_state_dict(state_dict)
+    state_dict: dict[str, torch.Tensor] = torch.load(args.pt_file, "cpu")
+    model: onnx.ModelProto = make_model_from_state_dict(state_dict, args.dtype)
     if args.verbose:
         print(model)
-    onnx.save_model(model, args.onnx_file)
+    onnx.save_model(
+            model, args.onnx_file, save_as_external_data=True,
+            location=f"{args.onnx_file}.data")
+    onnx.checker.check_model(pathlib.Path(args.onnx_file), full_check=True)
 
 
 if __name__ == "__main__":
