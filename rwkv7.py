@@ -389,6 +389,24 @@ def make_time_mix(dim: int, head_size: int, dim_att: int
 
 
 def make_channel_mix(C: int) -> onnx.FunctionProto:
+    deepemb_constants: list[onnx.NodeProto] = [
+            onnx.helper.make_node("Constant", [], ["[0]"], value_ints=[0]),
+            onnx.helper.make_node("Constant", [], ["[1]"], value_ints=[1]),
+            onnx.helper.make_node("Constant", [], ["[2]"], value_ints=[2]),
+            onnx.helper.make_node("Constant", [], ["[32]"], value_ints=[32])
+    ]
+
+    deepemb_shape: list[onnx.NodeProto] = [
+        onnx.helper.make_node("Shape", ["x"], ["BTC"]),
+        onnx.helper.make_node("Slice", ["BTC", "[0]", "[1]"], ["B"]),
+        onnx.helper.make_node("Slice", ["BTC", "[1]", "[2]"], ["T"]),
+        onnx.helper.make_node("Concat", ["B", "T", "[32]"], ["BT32"], axis=0),
+        onnx.helper.make_node("Concat", ["B", "T", "[1]", "[32]"], ["BT1x32"],
+                              axis=0),
+        onnx.helper.make_node(
+            "Concat", ["B", "T", "[32]", "[32]"], ["BT32x32"], axis=0)
+    ]
+
     time_shift: onnx.NodeProto = onnx.helper.make_node(
             "time_shift", ["x", "x_last"],
             ["x_shift", "x_last_next"], domain=__domain)
@@ -403,14 +421,47 @@ def make_channel_mix(C: int) -> onnx.FunctionProto:
     relu: onnx.NodeProto = onnx.helper.make_node("Relu", ["k"], ["relu"])
     relu2: onnx.NodeProto = onnx.helper.make_node(
             "Mul", ["relu", "relu"], ["relu2"])
+    x_s1_: onnx.NodeProto = onnx.helper.make_node(
+            "MatMul", ["x", "s1"], ["x_s1_"])
+    x_s1: onnx.NodeProto = onnx.helper.make_node(
+            "Reshape", ["x_s1_", "BT1x32"], ["x_s1"])
+    semb: onnx.NodeProto = onnx.helper.make_node(
+            "Reshape", ["semb_", "BT32x32"], ["semb"])
+    x_s1_semb_: onnx.NodeProto = onnx.helper.make_node(
+            "MatMul", ["x_s1", "semb"], ["x_s1_semb_"])
+    x_s1_semb: onnx.NodeProto = onnx.helper.make_node(
+            "Reshape", ["x_s1_semb_", "BT32"], ["x_s1_semb"])
+    x_s1_semb_s2: onnx.NodeProto = onnx.helper.make_node(
+            "MatMul", ["x_s1_semb", "s2"], ["x_s1_semb_s2"])
+    x_s1_semb_s2_s0: onnx.NodeProto = onnx.helper.make_node(
+            "Add", ["x_s1_semb_s2", "s0"], ["x_s1_semb_s2_s0"])
+    deepemb: onnx.NodeProto = onnx.helper.make_node(
+            "Mul", ["relu2", "x_s1_semb_s2_s0"], ["deepemb"])
+    # For normal RWKV-7
+    _deepemb: onnx.NodeProto = onnx.helper.make_node(
+            "Identity", ["relu2"], ["deepemb"])
+
     v: onnx.NodeProto = onnx.helper.make_node(
-            "MatMul", ["relu2", "value_weight_t"], ["v"])
-    return onnx.helper.make_function(
-            __domain, "channel_mix",
-            ["x", "x_last", "x_k", "key.weight", "value.weight"],
-            ["v", "x_last_next"],
-            [time_shift, lerp, key_weight_t,
-             value_weight_t, k, relu, relu2, v], __opset_imports)
+            "MatMul", ["deepemb", "value_weight_t"], ["v"])
+    return [
+            onnx.helper.make_function(
+                __domain, "channel_mix",
+                ["x", "x_last", "x_k", "key.weight", "value.weight"],
+                ["v", "x_last_next"],
+                [time_shift, lerp, key_weight_t,
+                 value_weight_t, k, relu, relu2, _deepemb, v], __opset_imports
+                ),
+            onnx.helper.make_function(
+                __domain, "channel_mix_a",
+                ["x", "x_last", "x_k", "key.weight", "value.weight",
+                 "s1", "semb_", "s2", "s0"],
+                ["v", "x_last_next"],
+                deepemb_constants + deepemb_shape + [
+                    time_shift, lerp, key_weight_t, value_weight_t,
+                    k, relu, relu2, x_s1_, x_s1, semb, x_s1_semb_, x_s1_semb,
+                    x_s1_semb_s2, x_s1_semb_s2_s0, deepemb, v],
+                __opset_imports)
+            ]
 
 
 def make_block() -> list[onnx.FunctionProto]:
@@ -453,6 +504,12 @@ def make_block() -> list[onnx.FunctionProto]:
             ["emb_tmix_x_ln2", "x_cmix_last",
              "ffn.x_k", "ffn.key.weight", "ffn.value.weight"],
             ["emb_cmix", "x_cmix_next"], domain=__domain)
+    cmix_a: onnx.NodeProto = onnx.helper.make_node(
+            "channel_mix_a",
+            ["emb_tmix_x_ln2", "x_cmix_last",
+             "ffn.x_k", "ffn.key.weight", "ffn.value.weight",
+             "ffn.s1", "semb", "ffn.s2", "ffn.s0"],
+            ["emb_cmix", "x_cmix_next"], domain=__domain)
     cmix_x: onnx.NodeProto = onnx.helper.make_node(
             "Add", ["emb_tmix_x", "emb_cmix"], ["emb_cmix_tmix_x"])
 
@@ -485,7 +542,40 @@ def make_block() -> list[onnx.FunctionProto]:
                  "att.output.weight", "att.ln_x.weight", "att.ln_x.bias",
                  "ffn.x_k", "ffn.key.weight", "ffn.value.weight"],
                 ["emb_cmix_tmix_x", "x_tmix_next", "wkv_next", "x_cmix_next"],
-                [ln0_, ln1, tmix, tmix_x, ln2, cmix, cmix_x], __opset_imports)]
+                [ln0_, ln1, tmix, tmix_x, ln2, cmix, cmix_x], __opset_imports),
+            onnx.helper.make_function(
+                __domain, "block0_a",
+                ["emb", "x_tmix_last", "wkv_state", "x_cmix_last",
+                 "ln0.weight", "ln0.bias",
+                 "ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias",
+                 "att.x_r", "att.x_w", "att.x_k", "att.x_v",
+                 "att.x_a", "att.x_g",
+                 "att.w1", "att.w2", "att.w0", "att.a1", "att.a2", "att.a0",
+                 "att.g1", "att.g2", "att.k_k", "att.k_a", "att.r_k",
+                 "att.receptance.weight", "att.key.weight", "att.value.weight",
+                 "att.output.weight", "att.ln_x.weight", "att.ln_x.bias",
+                 "ffn.x_k", "ffn.key.weight", "ffn.value.weight",
+                 "ffn.s1", "semb", "ffn.s2", "ffn.s0"],
+                ["emb_cmix_tmix_x", "v_first",
+                 "x_tmix_next", "wkv_next", "x_cmix_next"],
+                [ln0, ln1, tmix0, tmix_x, ln2, cmix_a, cmix_x],
+                __opset_imports),
+            onnx.helper.make_function(
+                __domain, "block_a",
+                ["emb", "v_first", "x_tmix_last", "wkv_state", "x_cmix_last",
+                 "ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias",
+                 "att.x_r", "att.x_w", "att.x_k", "att.x_v",
+                 "att.x_a", "att.x_g",
+                 "att.w1", "att.w2", "att.w0", "att.a1", "att.a2", "att.a0",
+                 "att.v1", "att.v2", "att.v0", "att.g1", "att.g2",
+                 "att.k_k", "att.k_a", "att.r_k",
+                 "att.receptance.weight", "att.key.weight", "att.value.weight",
+                 "att.output.weight", "att.ln_x.weight", "att.ln_x.bias",
+                 "ffn.x_k", "ffn.key.weight", "ffn.value.weight",
+                 "ffn.s1", "semb", "ffn.s2", "ffn.s0"],
+                ["emb_cmix_tmix_x", "x_tmix_next", "wkv_next", "x_cmix_next"],
+                [ln0_, ln1, tmix, tmix_x, ln2, cmix_a, cmix_x],
+                __opset_imports)]
 
 
 def make_sampling(internal_dtype: int = onnx.TensorProto.FLOAT
@@ -623,6 +713,9 @@ def make_model_from_state_dict(args: argparse.Namespace
                 continue
         break
 
+    # Is using DeepEmbed
+    is_deepemb: bool = "blocks.0.ffn.s_emb.weight" in state_dict.keys()
+
     normalize_function: onnx.FunctionProto = make_normalize()
     time_shift_function: onnx.FunctionProto = make_time_shift()
     linear_function: onnx.FunctionProto = make_linear()
@@ -631,7 +724,7 @@ def make_model_from_state_dict(args: argparse.Namespace
     wkv7_function: onnx.FunctionProto = make_wkv7(wkv_dtype_table[main_dtype])
     time_mix_functions: list[onnx.FunctionProto] = make_time_mix(
             dim, head_size, dim)
-    channel_mix_function: onnx.FunctionProto = make_channel_mix(dim)
+    channel_mix_functions: onnx.FunctionProto = make_channel_mix(dim)
     block_functions: list[onnx.FunctionProto] = make_block()
 
     onnx.checker.check_function(normalize_function)
@@ -643,7 +736,8 @@ def make_model_from_state_dict(args: argparse.Namespace
     onnx.checker.check_function(wkv7_function)
     _ = [onnx.checker.check_function(time_mix_function)
          for time_mix_function in time_mix_functions]
-    onnx.checker.check_function(channel_mix_function)
+    _ = [onnx.checker.check_function(channel_mix_function)
+         for channel_mix_function in channel_mix_functions]
     _ = [onnx.checker.check_function(block_function)
          for block_function in block_functions]
 
@@ -684,48 +778,117 @@ def make_model_from_state_dict(args: argparse.Namespace
     emb: onnx.NodeProto = onnx.helper.make_node(
             "Gather", ["emb.weight", "x"], ["emb"])
 
-    block0: onnx.NodeProto = onnx.helper.make_node(
-            "block0",
-            ["emb", "x_tmix_last_0", "wkv_state_0", "x_cmix_last_0",
-             "blocks.0.ln0.weight", "blocks.0.ln0.bias",
-             "blocks.0.ln1.weight", "blocks.0.ln1.bias",
-             "blocks.0.ln2.weight", "blocks.0.ln2.bias",
-             "blocks.0.att.x_r", "blocks.0.att.x_w", "blocks.0.att.x_k",
-             "blocks.0.att.x_v", "blocks.0.att.x_a", "blocks.0.att.x_g",
-             "blocks.0.att.w1", "blocks.0.att.w2", "blocks.0.att.w0",
-             "blocks.0.att.a1", "blocks.0.att.a2", "blocks.0.att.a0",
-             "blocks.0.att.g1", "blocks.0.att.g2", "blocks.0.att.k_k",
-             "blocks.0.att.k_a", "blocks.0.att.r_k",
-             "blocks.0.att.receptance.weight", "blocks.0.att.key.weight",
-             "blocks.0.att.value.weight", "blocks.0.att.output.weight",
-             "blocks.0.att.ln_x.weight", "blocks.0.att.ln_x.bias",
-             "blocks.0.ffn.x_k",
-             "blocks.0.ffn.key.weight", "blocks.0.ffn.value.weight"],
-            ["emb0", "v_first",
-             "x_tmix_next_0", "wkv_next_0", "x_cmix_next_0"], domain=__domain)
+    semb: list[onnx.NodeProto] = []
+    for i in range(nlayers):
+        if not is_deepemb:
+            break
+
+        semb.append(onnx.helper.make_node(
+            "Transpose", [f"blocks.{i}.ffn.s_emb_x.weight"],
+            [f"blocks.{i}.ffn.s_emb_x.weight_t"]))
+        semb.append(onnx.helper.make_node(
+            "MatMul", ["emb.weight", f"blocks.{i}.ffn.s_emb_x.weight_t"],
+            [f"blocks.{i}.ffn.s_emb_bias"]))
+        semb.append(onnx.helper.make_node(
+            "Add", [f"blocks.{i}.ffn.s_emb.weight",
+                    f"blocks.{i}.ffn.s_emb_bias"],
+            [f"blocks.{i}.ffn.s_emb.real_weight"]))
+        semb.append(onnx.helper.make_node(
+            "Gather", [f"blocks.{i}.ffn.s_emb.real_weight", "x"],
+            [f"blocks.{i}.ffn.semb"]))
+
+    if is_deepemb:
+        block0: onnx.NodeProto = onnx.helper.make_node(
+                "block0_a",
+                ["emb", "x_tmix_last_0", "wkv_state_0", "x_cmix_last_0",
+                 "blocks.0.ln0.weight", "blocks.0.ln0.bias",
+                 "blocks.0.ln1.weight", "blocks.0.ln1.bias",
+                 "blocks.0.ln2.weight", "blocks.0.ln2.bias",
+                 "blocks.0.att.x_r", "blocks.0.att.x_w", "blocks.0.att.x_k",
+                 "blocks.0.att.x_v", "blocks.0.att.x_a", "blocks.0.att.x_g",
+                 "blocks.0.att.w1", "blocks.0.att.w2", "blocks.0.att.w0",
+                 "blocks.0.att.a1", "blocks.0.att.a2", "blocks.0.att.a0",
+                 "blocks.0.att.g1", "blocks.0.att.g2", "blocks.0.att.k_k",
+                 "blocks.0.att.k_a", "blocks.0.att.r_k",
+                 "blocks.0.att.receptance.weight", "blocks.0.att.key.weight",
+                 "blocks.0.att.value.weight", "blocks.0.att.output.weight",
+                 "blocks.0.att.ln_x.weight", "blocks.0.att.ln_x.bias",
+                 "blocks.0.ffn.x_k",
+                 "blocks.0.ffn.key.weight", "blocks.0.ffn.value.weight",
+                 "blocks.0.ffn.s1", "blocks.0.ffn.semb",
+                 "blocks.0.ffn.s2", "blocks.0.ffn.s0"],
+                ["emb0", "v_first",
+                 "x_tmix_next_0", "wkv_next_0", "x_cmix_next_0"],
+                domain=__domain)
+    else:
+        block0: onnx.NodeProto = onnx.helper.make_node(
+                "block0",
+                ["emb", "x_tmix_last_0", "wkv_state_0", "x_cmix_last_0",
+                 "blocks.0.ln0.weight", "blocks.0.ln0.bias",
+                 "blocks.0.ln1.weight", "blocks.0.ln1.bias",
+                 "blocks.0.ln2.weight", "blocks.0.ln2.bias",
+                 "blocks.0.att.x_r", "blocks.0.att.x_w", "blocks.0.att.x_k",
+                 "blocks.0.att.x_v", "blocks.0.att.x_a", "blocks.0.att.x_g",
+                 "blocks.0.att.w1", "blocks.0.att.w2", "blocks.0.att.w0",
+                 "blocks.0.att.a1", "blocks.0.att.a2", "blocks.0.att.a0",
+                 "blocks.0.att.g1", "blocks.0.att.g2", "blocks.0.att.k_k",
+                 "blocks.0.att.k_a", "blocks.0.att.r_k",
+                 "blocks.0.att.receptance.weight", "blocks.0.att.key.weight",
+                 "blocks.0.att.value.weight", "blocks.0.att.output.weight",
+                 "blocks.0.att.ln_x.weight", "blocks.0.att.ln_x.bias",
+                 "blocks.0.ffn.x_k",
+                 "blocks.0.ffn.key.weight", "blocks.0.ffn.value.weight"],
+                ["emb0", "v_first",
+                 "x_tmix_next_0", "wkv_next_0", "x_cmix_next_0"],
+                domain=__domain)
     blocks: list[onnx.NodeProto] = [block0]
     for i in range(1, nlayers):
-        blocks.append(onnx.helper.make_node(
-            "block",
-            [f"emb{i - 1}", "v_first",
-             f"x_tmix_last_{i}", f"wkv_state_{i}", f"x_cmix_last_{i}",
-             f"blocks.{i}.ln1.weight", f"blocks.{i}.ln1.bias",
-             f"blocks.{i}.ln2.weight", f"blocks.{i}.ln2.bias",
-             f"blocks.{i}.att.x_r", f"blocks.{i}.att.x_w",
-             f"blocks.{i}.att.x_k", f"blocks.{i}.att.x_v",
-             f"blocks.{i}.att.x_a", f"blocks.{i}.att.x_g",
-             f"blocks.{i}.att.w1", f"blocks.{i}.att.w2", f"blocks.{i}.att.w0",
-             f"blocks.{i}.att.a1", f"blocks.{i}.att.a2", f"blocks.{i}.att.a0",
-             f"blocks.{i}.att.v1", f"blocks.{i}.att.v2", f"blocks.{i}.att.v0",
-             f"blocks.{i}.att.g1", f"blocks.{i}.att.g2", f"blocks.{i}.att.k_k",
-             f"blocks.{i}.att.k_a", f"blocks.{i}.att.r_k",
-             f"blocks.{i}.att.receptance.weight", f"blocks.{i}.att.key.weight",
-             f"blocks.{i}.att.value.weight", f"blocks.{i}.att.output.weight",
-             f"blocks.{i}.att.ln_x.weight", f"blocks.{i}.att.ln_x.bias",
-             f"blocks.{i}.ffn.x_k",
-             f"blocks.{i}.ffn.key.weight", f"blocks.{i}.ffn.value.weight"],
-            [f"emb{i}", f"x_tmix_next_{i}", f"wkv_next_{i}",
-             f"x_cmix_next_{i}"], domain=__domain))
+        if is_deepemb:
+            blocks.append(onnx.helper.make_node(
+                "block_a",
+                [f"emb{i - 1}", "v_first",
+                 f"x_tmix_last_{i}", f"wkv_state_{i}", f"x_cmix_last_{i}",
+                 f"blocks.{i}.ln1.weight", f"blocks.{i}.ln1.bias",
+                 f"blocks.{i}.ln2.weight", f"blocks.{i}.ln2.bias",
+                 f"blocks.{i}.att.x_r", f"blocks.{i}.att.x_w",
+                 f"blocks.{i}.att.x_k", f"blocks.{i}.att.x_v",
+                 f"blocks.{i}.att.x_a", f"blocks.{i}.att.x_g",
+                 f"blocks.{i}.att.w1", f"blocks.{i}.att.w2", f"blocks.{i}.att.w0",
+                 f"blocks.{i}.att.a1", f"blocks.{i}.att.a2", f"blocks.{i}.att.a0",
+                 f"blocks.{i}.att.v1", f"blocks.{i}.att.v2", f"blocks.{i}.att.v0",
+                 f"blocks.{i}.att.g1", f"blocks.{i}.att.g2", f"blocks.{i}.att.k_k",
+                 f"blocks.{i}.att.k_a", f"blocks.{i}.att.r_k",
+                 f"blocks.{i}.att.receptance.weight", f"blocks.{i}.att.key.weight",
+                 f"blocks.{i}.att.value.weight", f"blocks.{i}.att.output.weight",
+                 f"blocks.{i}.att.ln_x.weight", f"blocks.{i}.att.ln_x.bias",
+                 f"blocks.{i}.ffn.x_k",
+                 f"blocks.{i}.ffn.key.weight", f"blocks.{i}.ffn.value.weight",
+                 f"blocks.{i}.ffn.s1", f"blocks.{i}.ffn.semb",
+                 f"blocks.{i}.ffn.s2", f"blocks.{i}.ffn.s0"],
+                [f"emb{i}", f"x_tmix_next_{i}", f"wkv_next_{i}",
+                 f"x_cmix_next_{i}"], domain=__domain))
+        else:
+            blocks.append(onnx.helper.make_node(
+                "block",
+                [f"emb{i - 1}", "v_first",
+                 f"x_tmix_last_{i}", f"wkv_state_{i}", f"x_cmix_last_{i}",
+                 f"blocks.{i}.ln1.weight", f"blocks.{i}.ln1.bias",
+                 f"blocks.{i}.ln2.weight", f"blocks.{i}.ln2.bias",
+                 f"blocks.{i}.att.x_r", f"blocks.{i}.att.x_w",
+                 f"blocks.{i}.att.x_k", f"blocks.{i}.att.x_v",
+                 f"blocks.{i}.att.x_a", f"blocks.{i}.att.x_g",
+                 f"blocks.{i}.att.w1", f"blocks.{i}.att.w2", f"blocks.{i}.att.w0",
+                 f"blocks.{i}.att.a1", f"blocks.{i}.att.a2", f"blocks.{i}.att.a0",
+                 f"blocks.{i}.att.v1", f"blocks.{i}.att.v2", f"blocks.{i}.att.v0",
+                 f"blocks.{i}.att.g1", f"blocks.{i}.att.g2", f"blocks.{i}.att.k_k",
+                 f"blocks.{i}.att.k_a", f"blocks.{i}.att.r_k",
+                 f"blocks.{i}.att.receptance.weight", f"blocks.{i}.att.key.weight",
+                 f"blocks.{i}.att.value.weight", f"blocks.{i}.att.output.weight",
+                 f"blocks.{i}.att.ln_x.weight", f"blocks.{i}.att.ln_x.bias",
+                 f"blocks.{i}.ffn.x_k",
+                 f"blocks.{i}.ffn.key.weight", f"blocks.{i}.ffn.value.weight"],
+                [f"emb{i}", f"x_tmix_next_{i}", f"wkv_next_{i}",
+                 f"x_cmix_next_{i}"], domain=__domain))
 
     ln_out: onnx.NodeProto = onnx.helper.make_node(
             "LayerNormalization",
@@ -759,7 +922,7 @@ def make_model_from_state_dict(args: argparse.Namespace
         ]
         sampling_function.append(make_sampling(torch_onnx_dtype[main_dtype]))
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
-                list(parameters.values()) + [emb] + blocks + [
+                list(parameters.values()) + [emb] + semb + blocks + [
                     ln_out, head] + sampling,
                 "RWKV7-LM",
                 [x_value_info] + state_value_infos,
@@ -767,7 +930,7 @@ def make_model_from_state_dict(args: argparse.Namespace
                 initializer=list(tensor_proto_state_dict.values()))
     else:
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
-                list(parameters.values()) + [emb] + blocks + [ln_out, head],
+                list(parameters.values()) + [emb] + semb + blocks + [ln_out, head],
                 "RWKV7-LM",
                 [x_value_info] + state_value_infos,
                 [head_value_info] + next_value_infos,
@@ -778,7 +941,7 @@ def make_model_from_state_dict(args: argparse.Namespace
             functions=[normalize_function, time_shift_function, lerp_function,
                        linear_function] + loramlp_functions + [wkv7_function]
             + time_mix_functions +
-            [channel_mix_function] + block_functions + sampling_function
+            channel_mix_functions + block_functions + sampling_function
             )
 
     # onnx.checker.check_model(rwkv_lm_model, full_check=True)
