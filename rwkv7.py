@@ -8,7 +8,7 @@ import pathlib
 
 __domain: str = "rwkv7"
 __opset_imports: list[onnx.OperatorSetIdProto] = [
-        onnx.helper.make_opsetid("", 22),
+        onnx.helper.make_opsetid("", 21),
         onnx.helper.make_opsetid(__domain, 1)]
 
 
@@ -488,9 +488,101 @@ def make_block() -> list[onnx.FunctionProto]:
                 [ln0_, ln1, tmix, tmix_x, ln2, cmix, cmix_x], __opset_imports)]
 
 
-def make_model_from_state_dict(
-        state_dict: dict[str, torch.Tensor], dtype: str
-        ) -> onnx.ModelProto | dict[onnx.ModelProto]:
+def make_sampling(internal_dtype: int = onnx.TensorProto.FLOAT
+                  ) -> onnx.FunctionProto:
+    constants: list[onnx.NodeProto] = [
+            onnx.helper.make_node("Constant", [], ["[-1]"], value_ints=[-1]),
+            onnx.helper.make_node("Constant", [], ["[0]"], value_ints=[0]),
+            onnx.helper.make_node("Constant", [], ["[1]"], value_ints=[1]),
+            onnx.helper.make_node("Constant", [], ["[2]"], value_ints=[2]),
+            onnx.helper.make_node("Constant", [], ["[3]"], value_ints=[3]),
+            onnx.helper.make_node("Constant", [], ["-1"], value_int=-1),
+            onnx.helper.make_node("Constant", [], ["0"], value_int=0),
+            onnx.helper.make_node(
+                "Constant", [], ["starts"], value_ints=[0, 0, 0]),
+            onnx.helper.make_node("Cast", ["x_"], ["x"], to=internal_dtype),
+            onnx.helper.make_node("Cast", ["temp_"], ["temp"],
+                                  to=internal_dtype),
+            onnx.helper.make_node("Unsqueeze", ["topk_", "0"], ["topk"]),
+            onnx.helper.make_node("Cast", ["topp_"], ["topp"],
+                                  to=internal_dtype)
+    ]
+
+    shapes: list[onnx.NodeProto] = [
+            onnx.helper.make_node("Shape", ["x_"], ["BTV"]),
+            onnx.helper.make_node("Slice", ["BTV", "[0]", "[1]"], ["B"]),
+            onnx.helper.make_node("Slice", ["BTV", "[1]", "[2]"], ["T"]),
+            onnx.helper.make_node("Slice", ["BTV", "[2]", "[3]"], ["V"]),
+            onnx.helper.make_node("Mul", ["B", "T"], ["B*T"]),
+            onnx.helper.make_node("Concat", ["B*T", "V"], ["B*TV"], axis=0),
+            onnx.helper.make_node("Concat", ["B", "T"], ["BT"], axis=0),
+            onnx.helper.make_node("Concat", ["BT", "[1]"], ["BT1"], axis=0),
+            onnx.helper.make_node("Concat", ["BT", "topk"], ["BTK"], axis=0),
+            onnx.helper.make_node("Concat", ["B*T", "topk"], ["B*TK"], axis=0)
+    ]
+
+    temperature: list[onnx.NodeProto] = [
+            onnx.helper.make_node("Div", ["x", "temp"], ["x_temp"]),
+            onnx.helper.make_node("Softmax", ["x_temp"], ["temp_softmax"])
+    ]
+
+    topk: list[onnx.NodeProto] = [
+            onnx.helper.make_node("TopK", ["temp_softmax", "topk"],
+                                  ["topk_temp_softmax_", "topk_idx"]),
+            onnx.helper.make_node("Reshape",
+                                  ["topk_idx", "B*TK"], ["topk_idx_bt"]),
+            onnx.helper.make_node("ReduceSum", ["topk_temp_softmax_", "[-1]"],
+                                  ["topk_temp_softmax_sum"]),
+            onnx.helper.make_node(
+                "Div", ["topk_temp_softmax_", "topk_temp_softmax_sum"],
+                ["topk_scaled"])
+    ]
+
+    topp: list[onnx.NodeProto] = [
+            onnx.helper.make_node(
+                "Cast", ["0"], ["0_casted"], to=internal_dtype),
+            onnx.helper.make_node(
+                "CumSum", ["topk_scaled", "[-1]"], ["topk_scaled_cumsum"],
+                exclusive=1),
+            onnx.helper.make_node(
+                "GreaterOrEqual", ["topk_scaled_cumsum", "topp"],
+                ["topp_filter"]),
+            onnx.helper.make_node("Where",
+                                  ["topp_filter", "0_casted", "topk_scaled"],
+                                  ["topp_topk_scaled"]),
+            onnx.helper.make_node("ReduceSum", ["topp_topk_scaled", "[-1]"],
+                                  ["topp_topk_scaled_sum"]),
+            onnx.helper.make_node(
+                "Div", ["topp_topk_scaled", "topp_topk_scaled_sum"],
+                ["topp_scaled"]),
+    ]
+
+    sampling: list[onnx.NodeProto] = [
+            onnx.helper.make_node(
+                "Cast", ["topp_scaled"], ["topp_scaled_casted"],
+                to=onnx.TensorProto.FLOAT),
+            onnx.helper.make_node("Reshape", ["topp_scaled_casted", "B*TK"],
+                                  ["topp_scaled_bt"]),
+            onnx.helper.make_node("Log", ["topp_scaled_bt"], ["topp_scaled_bt_log"]),
+            onnx.helper.make_node(
+                "Multinomial", ["topp_scaled_bt_log"], ["sampled_idx_bt_"],
+                dtype=onnx.TensorProto.INT64),
+            onnx.helper.make_node(
+                "GatherElements", ["topk_idx_bt", "sampled_idx_bt_"], ["idx_bt"], axis=1),
+            onnx.helper.make_node("Reshape", ["idx_bt", "BT"], ["idx"])
+    ]
+
+    return onnx.helper.make_function(
+            __domain, "sampling", ["x_", "temp_", "topk_", "topp_"], ["idx"],
+            constants + shapes + temperature + topk + topp + sampling,
+            __opset_imports)
+
+
+def make_model_from_state_dict(args: argparse.Namespace
+                               ) -> onnx.ModelProto | dict[onnx.ModelProto]:
+    state_dict: dict[str, torch.Tensor] = torch.load(args.pt_file, "cpu")
+    dtype: str = args.dtype
+
     torch_onnx_dtype: dict[torch.dtype, int] = {
             torch.float: onnx.TensorProto.FLOAT,
             torch.float16: onnx.TensorProto.FLOAT16,
@@ -641,19 +733,52 @@ def make_model_from_state_dict(
     head: onnx.NodeProto = onnx.helper.make_node(
             "linear", ["ln_out", "head.weight"], ["head"], domain=__domain)
 
-    rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
-            list(parameters.values()) + [emb] + blocks + [ln_out, head],
-            "RWKV7-LM",
-            [x_value_info] + state_value_infos,
-            [head_value_info] + next_value_infos,
-            initializer=list(tensor_proto_state_dict.values()))
+    sampling_function: list[onnx.FunctionProto] = []
+    if args.sampling:
+        if args.topk == -1:
+            args.topk = vocab_size
+
+        assert 0.0 < args.temperature
+        assert (0 < args.topk) and (args.topk <= vocab_size)
+        assert (0.0 < args.topp) and (args.topp <= 1.0)
+
+        y_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
+                "y", onnx.TensorProto.INT64, ["batch", "seq"])
+
+        sampling: list[onnx.NodeProto] = [
+                onnx.helper.make_node("Constant", [], ["temperature"],
+                                      value_float=args.temperature),
+                onnx.helper.make_node(
+                    "Constant", [], ["topk"],
+                    value_int=args.topk),
+                onnx.helper.make_node("Constant", [], ["topp"],
+                                      value_float=args.topp),
+                onnx.helper.make_node(
+                    "sampling", ["head", "temperature", "topk", "topp"], ["y"],
+                    domain=__domain)
+        ]
+        sampling_function.append(make_sampling(torch_onnx_dtype[main_dtype]))
+        rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
+                list(parameters.values()) + [emb] + blocks + [
+                    ln_out, head] + sampling,
+                "RWKV7-LM",
+                [x_value_info] + state_value_infos,
+                [y_value_info] + next_value_infos,
+                initializer=list(tensor_proto_state_dict.values()))
+    else:
+        rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
+                list(parameters.values()) + [emb] + blocks + [ln_out, head],
+                "RWKV7-LM",
+                [x_value_info] + state_value_infos,
+                [head_value_info] + next_value_infos,
+                initializer=list(tensor_proto_state_dict.values()))
 
     rwkv_lm_model: onnx.ModelProto = onnx.helper.make_model(
             rwkv_lm, opset_imports=__opset_imports,
             functions=[normalize_function, time_shift_function, lerp_function,
                        linear_function] + loramlp_functions + [wkv7_function]
             + time_mix_functions +
-            [channel_mix_function] + block_functions
+            [channel_mix_function] + block_functions + sampling_function
             )
 
     # onnx.checker.check_model(rwkv_lm_model, full_check=True)
@@ -669,14 +794,22 @@ def main():
                         action="store_true")
     parser.add_argument("-t", "--dtype", help="data type", default="fp32",
                         choices=["auto", "fp32", "fp16", "bf16"])
+    parser.add_argument("-s", "--sampling", help="include sampling function",
+                        action="store_true")
+    parser.add_argument("--temperature", help="temperature for sampling",
+                        default=0.3, type=float)
+    parser.add_argument(
+            "--topk", help="TopK for sampling, -1 to disable",
+            default=-1, type=int)
+    parser.add_argument("--topp", help="TopP for sampling",
+                        default=0.3, type=float)
     parser.add_argument("pt_file",
                         help="A PyTorch file which contains state dict.")
     parser.add_argument("onnx_file",
                         help="The ONNX file name which will be saved.")
 
     args: argparse.Namespace = parser.parse_args()
-    state_dict: dict[str, torch.Tensor] = torch.load(args.pt_file, "cpu")
-    model: onnx.ModelProto = make_model_from_state_dict(state_dict, args.dtype)
+    model: onnx.ModelProto = make_model_from_state_dict(args)
     if args.verbose:
         print(model)
     onnx.save_model(
