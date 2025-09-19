@@ -1,4 +1,5 @@
 import onnx
+import onnx.inliner
 import numpy as np
 import torch
 import argparse
@@ -897,7 +898,7 @@ def make_model_from_state_dict(args: argparse.Namespace
             "linear", ["ln_out", "head.weight"], ["head"], domain=__domain)
 
     sampling_function: list[onnx.FunctionProto] = []
-    if args.sampling:
+    if args.sampling or args.sampling_with_head:
         if args.topk == -1:
             args.topk = vocab_size
 
@@ -905,8 +906,11 @@ def make_model_from_state_dict(args: argparse.Namespace
         assert (0 < args.topk) and (args.topk <= vocab_size)
         assert (0.0 < args.topp) and (args.topp <= 1.0)
 
-        y_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
-                "y", onnx.TensorProto.INT64, ["batch", "seq"])
+        y_value_infos: list[onnx.ValueInfoProto] = []
+        y_value_infos.append(onnx.helper.make_tensor_value_info(
+                "y", onnx.TensorProto.INT64, ["batch", "seq"]))
+        if args.sampling_with_head:
+            y_value_infos.append(head_value_info)
 
         sampling: list[onnx.NodeProto] = [
                 onnx.helper.make_node("Constant", [], ["temperature"],
@@ -926,7 +930,7 @@ def make_model_from_state_dict(args: argparse.Namespace
                     ln_out, head] + sampling,
                 "RWKV7-LM",
                 [x_value_info] + state_value_infos,
-                [y_value_info] + next_value_infos,
+                y_value_infos + next_value_infos,
                 initializer=list(tensor_proto_state_dict.values()))
     else:
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
@@ -944,6 +948,9 @@ def make_model_from_state_dict(args: argparse.Namespace
             channel_mix_functions + block_functions + sampling_function
             )
 
+    if args.inline:
+        rwkv_lm_model = onnx.inliner.inline_local_functions(rwkv_lm_model)
+
     # onnx.checker.check_model(rwkv_lm_model, full_check=True)
 
     return rwkv_lm_model
@@ -957,8 +964,13 @@ def main():
                         action="store_true")
     parser.add_argument("-t", "--dtype", help="data type", default="fp32",
                         choices=["auto", "fp32", "fp16", "bf16"])
-    parser.add_argument("-s", "--sampling", help="include sampling function",
+    parser.add_argument("-s", "--sampling",
+                        help="Outputs token id instead of logit",
                         action="store_true")
+    parser.add_argument("--sampling_with_head",
+                        help="Outputs both token id and logit",
+                        action="store_true")
+    parser.add_argument("--inline", help="", action="store_true")
     parser.add_argument("--temperature", help="temperature for sampling",
                         default=0.3, type=float)
     parser.add_argument(

@@ -36,3 +36,7 @@ Lots of implementation problem still exists.
 ~~Example code in C is available at cli-chat/.~~
 
 The example code still available, but I recommend using Chatbot.
+
+## MEMO
+
+onnxruntime-training works in Python 3.11, not 3.12
