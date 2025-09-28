@@ -746,6 +746,8 @@ def make_model_from_state_dict(args: argparse.Namespace
     tensor_proto_state_dict: dict[str, onnx.TensorProto] = {}
     parameters: dict[str, onnx.NodeProto] = {}
     for k in list(state_dict.keys()):
+        if not k.startswith("blocks.0.") and (k.endswith("ln0.weight") or k.endswith("ln0.bias")):
+            continue  # Skip unused parameters to avoid potential bugs
         tensor: np.ndarray = state_dict[k].detach(
                 ).cpu().to(torch.float).numpy()
         tensor_proto_state_dict[k] = onnx.numpy_helper.from_array(
