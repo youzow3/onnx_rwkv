@@ -1,5 +1,6 @@
 import onnx
 import onnx.inliner
+import ml_dtypes
 import numpy as np
 import torch
 import argparse
@@ -50,35 +51,22 @@ def make_linear() -> onnx.FunctionProto:
 
 def make_time_shift() -> onnx.FunctionProto:
     constants: list[onnx.NodeProto] = [
-            onnx.helper.make_node("Constant", [], ["zero"], value_ints=[0]),
-            onnx.helper.make_node("Constant", [], ["one"], value_ints=[1]),
-            onnx.helper.make_node("Constant", [], ["two"], value_ints=[2]),
-            onnx.helper.make_node("Constant", [], ["three"], value_ints=[3]),
+            onnx.helper.make_node("Constant", [], ["0"], value_ints=[0]),
             onnx.helper.make_node(
                 "Constant", [], ["max"], value_ints=[np.iinfo(np.int64).max]),
             onnx.helper.make_node("Constant", [], ["x_end"], value_ints=[-1]),
             onnx.helper.make_node("Constant", [], ["T_axes"], value_ints=[1])]
-    broadcast: list[onnx.NodeProto] = [
-            onnx.helper.make_node("Shape", ["x"], ["x_shape"]),
-            onnx.helper.make_node(
-                "Slice", ["x_shape", "zero", "one", "zero"], ["B"]),
-            onnx.helper.make_node(
-                "Slice", ["x_shape", "two", "three", "zero"], ["C"]),
-            onnx.helper.make_node(
-                "Concat", ["B", "one", "C"], ["expand_shape"], axis=0),
-            onnx.helper.make_node(
-                "Expand", ["x_last_", "expand_shape"], ["x_last"])]
     x_shift: list[onnx.NodeProto] = [
             onnx.helper.make_node(
-                "Slice", ["x", "zero", "x_end", "T_axes"], ["x_shift_"]),
+                "Slice", ["x", "0", "x_end", "T_axes"], ["x_shift_"]),
             onnx.helper.make_node(
                 "Concat", ["x_last", "x_shift_"], ["x_shift"], axis=1)]
     x_next: onnx.NodeProto = onnx.helper.make_node(
             "Slice", ["x", "x_end", "max", "T_axes"], ["x_next"])
 
     return onnx.helper.make_function(
-            __domain, "time_shift", ["x", "x_last_"], ["x_shift", "x_next"],
-            constants + broadcast + x_shift + [x_next], __opset_imports)
+            __domain, "time_shift", ["x", "x_last"], ["x_shift", "x_next"],
+            constants + x_shift + [x_next], __opset_imports)
 
 
 def make_lerp() -> onnx.FunctionProto:
@@ -179,18 +167,9 @@ def make_wkv7(dtype: int) -> onnx.FunctionProto:
     # WKV preparation
     #
     constants: list[onnx.NodeProto] = [
-            onnx.helper.make_node("Constant", [], ["[0]"], value_ints=[0]),
-            onnx.helper.make_node("Constant", [], ["[1]"], value_ints=[1]),
             onnx.helper.make_node("Constant", [], ["[3]"], value_ints=[3]),
             onnx.helper.make_node("Constant", [], ["[4]"], value_ints=[4])]
-    broadcast: list[onnx.NodeProto] = [
-            onnx.helper.make_node("Shape", ["r"], ["BTHN"]),
-            onnx.helper.make_node("Shape", ["wkv_state_"], ["1HNN"]),
-            onnx.helper.make_node("Slice", ["BTHN", "[0]", "[1]"], ["B"]),
-            onnx.helper.make_node("Slice", ["1HNN", "[1]", "[4]"], ["HNN"]),
-            onnx.helper.make_node("Concat", ["B", "HNN"], ["BHNN"], axis=0),
-            onnx.helper.make_node(
-                "Expand", ["wkv_state_", "BHNN"], ["wkv_state"])]
+    broadcast = []
     ab: list[onnx.NodeProto] = [
             onnx.helper.make_node("Unsqueeze", ["a", "[4]"], ["a_t"]),
             onnx.helper.make_node("Unsqueeze", ["b", "[3]"], ["b_t"]),
@@ -224,7 +203,7 @@ def make_wkv7(dtype: int) -> onnx.FunctionProto:
 
     return onnx.helper.make_function(
             __domain, "wkv7",
-            ["wkv_state_", "r", "w", "k", "v", "a", "b"],
+            ["wkv_state", "r", "w", "k", "v", "a", "b"],
             ["wkv_state_next", "rwkv"],
             constants + broadcast + ab + vk + [
                 w_float, ab_float, vk_float, wkv_loop, wkv_out_casted] + rwkv,
@@ -468,13 +447,13 @@ def make_channel_mix(C: int) -> onnx.FunctionProto:
 def make_block() -> list[onnx.FunctionProto]:
     ln0: onnx.NodeProto = onnx.helper.make_node(
             "LayerNormalization",
-            ["emb", "ln0.weight", "ln0.bias"], ["emb_ln0"])
+            ["emb", "ln0.weight", "ln0.bias"], ["emb_ln0", "emb_ln0_mean", "emb_ln0_invstdev"])
     ln0_: onnx.NodeProto = onnx.helper.make_node(
             "Identity", ["emb"], ["emb_ln0"])
 
     ln1: onnx.NodeProto = onnx.helper.make_node(
             "LayerNormalization",
-            ["emb_ln0", "ln1.weight", "ln1.bias"], ["emb_ln1"])
+            ["emb_ln0", "ln1.weight", "ln1.bias"], ["emb_ln1", "emb_ln1_mean", "emb_ln1_invstdev"])
     tmix0: onnx.NodeProto = onnx.helper.make_node(
             "time_mix0",
             ["emb_ln1", "x_tmix_last", "wkv_state",
@@ -499,7 +478,7 @@ def make_block() -> list[onnx.FunctionProto]:
             "Add", ["emb_ln0", "emb_tmix"], ["emb_tmix_x"])
     ln2: onnx.NodeProto = onnx.helper.make_node(
             "LayerNormalization",
-            ["emb_tmix_x", "ln2.weight", "ln2.bias"], ["emb_tmix_x_ln2"])
+            ["emb_tmix_x", "ln2.weight", "ln2.bias"], ["emb_tmix_x_ln2", "emb_tmix_x_ln2_mean", "emb_tmix_x_ln2_invstdev"])
     cmix: onnx.NodeProto = onnx.helper.make_node(
             "channel_mix",
             ["emb_tmix_x_ln2", "x_cmix_last",
@@ -682,21 +661,30 @@ def make_model_from_state_dict(args: argparse.Namespace
             "auto": state_dict["emb.weight"].dtype,
             "fp32": torch.float,
             "fp16": torch.float16,
+            "fp16-mixed": torch.float16,
+            "bf16": torch.bfloat16}
+    wkv_dtype_table: dict[str, torch.dtype] = {
+            "auto": state_dict["emb.weight"].dtype,
+            "fp32": torch.float,
+            "fp16": torch.float16,
+            "fp16-mixed": torch.float,
             "bf16": torch.bfloat16}
     np_dtype_table: dict[torch.dtype, np.dtype] = {
             torch.float: np.float32,
             torch.float16: np.float16,
-            torch.bfloat16: onnx._custom_element_types.bfloat16
+            torch.bfloat16: ml_dtypes.bfloat16
             }
-    wkv_dtype_table: dict[torch.dtype, int] = {
+    onnx_dtype_table: dict[torch.dtype, int] = {
             torch.float: onnx.TensorProto.FLOAT,
-            torch.float16: onnx.TensorProto.FLOAT,
-            torch.bfloat16: onnx.TensorProto.BFLOAT16}
+            torch.float16: onnx.TensorProto.FLOAT16,
+            torch.bfloat16: onnx.TensorProto.BFLOAT16
+            }
 
     # Get main dtype
     main_dtype: torch.dtype = dtype_table[dtype]
+    wkv_dtype: torch.dtype = wkv_dtype_table[dtype]
     onnx_main_dtype: int = torch_onnx_dtype[main_dtype]
-    onnx_wkv_dtype: int = wkv_dtype_table[main_dtype]
+    onnx_wkv_dtype: int = torch_onnx_dtype[wkv_dtype]
     # Get embedding dimension
     dim: int = state_dict["emb.weight"].shape[1]
     # vocab size
@@ -706,13 +694,22 @@ def make_model_from_state_dict(args: argparse.Namespace
     n_head: int = dim // head_size
 
     # Get number of layers
+    nlayers_actual: int = 0
     nlayers: int = 0
-    while True:
-        for k in state_dict.keys():
-            if k.startswith(f"blocks.{nlayers}"):
+    for k in state_dict.keys():
+        if k.startswith(f"blocks.{nlayers_actual}"):
+            nlayers_actual += 1
+            if args.partial is not None and nlayers_actual < args.partial:
                 nlayers += 1
-                continue
-        break
+            continue
+    if args.partial is None:
+        nlayers = nlayers_actual
+    else:
+        nlayers += 1
+    unused_key_prefix: list[str] = [f"blocks.{layer}" for layer in range(nlayers, nlayers_actual)]
+    unused_key: list[str] = [key for key in state_dict.keys() if any([key.startswith(prefix) for prefix in unused_key_prefix])]
+    for k in unused_key:
+        state_dict.pop(k)
 
     # Is using DeepEmbed
     is_deepemb: bool = "blocks.0.ffn.s_emb.weight" in state_dict.keys()
@@ -722,7 +719,7 @@ def make_model_from_state_dict(args: argparse.Namespace
     linear_function: onnx.FunctionProto = make_linear()
     lerp_function: onnx.FunctionProto = make_lerp()
     loramlp_functions: list[onnx.FunctionProto] = make_loramlp()
-    wkv7_function: onnx.FunctionProto = make_wkv7(wkv_dtype_table[main_dtype])
+    wkv7_function: onnx.FunctionProto = make_wkv7(onnx_wkv_dtype)
     time_mix_functions: list[onnx.FunctionProto] = make_time_mix(
             dim, head_size, dim)
     channel_mix_functions: onnx.FunctionProto = make_channel_mix(dim)
@@ -744,7 +741,9 @@ def make_model_from_state_dict(args: argparse.Namespace
 
     # Obtain TensorProtos of parameters
     tensor_proto_state_dict: dict[str, onnx.TensorProto] = {}
+    type_proto_state_dict: dict[str, onnx.ValueInfoProto] = {}
     parameters: dict[str, onnx.NodeProto] = {}
+    parameter_names: list[str] = []
     for k in list(state_dict.keys()):
         if not k.startswith("blocks.0.") and (k.endswith("ln0.weight") or k.endswith("ln0.bias")):
             continue  # Skip unused parameters to avoid potential bugs
@@ -752,6 +751,9 @@ def make_model_from_state_dict(args: argparse.Namespace
                 ).cpu().to(torch.float).numpy()
         tensor_proto_state_dict[k] = onnx.numpy_helper.from_array(
                 tensor.astype(np_dtype_table[main_dtype]), f"{k}")
+        type_proto_state_dict[k] = onnx.helper.make_tensor_value_info(
+                k, onnx_dtype_table[main_dtype], tensor.shape)
+        parameter_names.append(k)
 
     # Input/Output value info
     x_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
@@ -895,7 +897,7 @@ def make_model_from_state_dict(args: argparse.Namespace
 
     ln_out: onnx.NodeProto = onnx.helper.make_node(
             "LayerNormalization",
-            [f"emb{nlayers - 1}", "ln_out.weight", "ln_out.bias"], ["ln_out"])
+            [f"emb{nlayers - 1}", "ln_out.weight", "ln_out.bias"], ["ln_out", "ln_out_mean", "ln_out_invstdev"])
     head: onnx.NodeProto = onnx.helper.make_node(
             "linear", ["ln_out", "head.weight"], ["head"], domain=__domain)
 
@@ -933,14 +935,16 @@ def make_model_from_state_dict(args: argparse.Namespace
                 "RWKV7-LM",
                 [x_value_info] + state_value_infos,
                 y_value_infos + next_value_infos,
-                initializer=list(tensor_proto_state_dict.values()))
+                initializer=list(tensor_proto_state_dict.values()),
+                value_info=list(type_proto_state_dict.values()))
     else:
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
                 list(parameters.values()) + [emb] + semb + blocks + [ln_out, head],
                 "RWKV7-LM",
                 [x_value_info] + state_value_infos,
                 [head_value_info] + next_value_infos,
-                initializer=list(tensor_proto_state_dict.values()))
+                initializer=list(tensor_proto_state_dict.values()),
+                value_info=list(type_proto_state_dict.values()))
 
     rwkv_lm_model: onnx.ModelProto = onnx.helper.make_model(
             rwkv_lm, opset_imports=__opset_imports,
@@ -950,12 +954,51 @@ def make_model_from_state_dict(args: argparse.Namespace
             channel_mix_functions + block_functions + sampling_function
             )
 
-    if args.inline:
-        rwkv_lm_model = onnx.inliner.inline_local_functions(rwkv_lm_model)
-
+    # Cannot check model if the model size > 2GiB
     # onnx.checker.check_model(rwkv_lm_model, full_check=True)
 
-    return rwkv_lm_model
+    return rwkv_lm_model, parameter_names
+
+
+def generate_training_artifacts(args: argparse.Namespace, parameters: list[str]) -> None:
+    import onnxruntime as ort
+    import onnxruntime.training.onnxblock as onnxblock
+    from onnxruntime.training.artifacts import generate_artifacts, LossType, OptimType
+
+    class ModelLoss(onnxblock.TrainingBlock):
+        def __init__(self):
+            super().__init__()
+            self.loss_fn: onnxblock.Block = onnxblock.loss.CrossEntropyLoss()
+
+        def build(self, logit: str) -> str:
+            return self.loss_fn(logit, "y_actual")
+
+    loss: onnxblock.TrainingBlock = ModelLoss()
+    model: onnx.ModelProto = onnx.load_model(args.onnx_file)
+    for initializer in model.graph.initializer:
+        name: str = initializer.name
+        loss.requires_grad(name, name in parameters)
+
+    optimizer: onnxblock.ForwardBlock = onnxblock.optim.SGD()
+
+    training_model: onnx.ModelProto
+    eval_model: onnx.ModelProto
+    model_params: Any
+    with onnxblock.base(model):
+        _ = loss("head")
+        training_model, eval_model = loss.to_model_proto()
+        model_params = loss.parameters()
+
+    optimizer: onnxblock.ForwardBlock = onnxblock.optim.SGD()
+    optimizer_model: onnx.ModelProto
+    with onnxblock.empty_base():
+        _ = optimizer(model_params)
+        optimizer_model = optimizer.to_model_proto()
+
+    onnxblock.save_checkpoint(model_params, f"checkpoint-{args.onnx_file}")
+    onnx.save_model(training_model, f"training-{args.onnx_file}", save_as_external_data=True)
+    onnx.save_model(eval_model, f"eval-{args.onnx_file}", save_as_external_data=True)
+    onnx.save(optimizer_model, f"optimizer-{args.onnx_file}")
 
 
 def main():
@@ -965,7 +1008,7 @@ def main():
     parser.add_argument("-v", "--verbose", help="verbose output",
                         action="store_true")
     parser.add_argument("-t", "--dtype", help="data type", default="fp32",
-                        choices=["auto", "fp32", "fp16", "bf16"])
+                        choices=["auto", "fp32", "fp16", "fp16-mixed", "bf16"])
     parser.add_argument("-s", "--sampling",
                         help="Outputs token id instead of logit",
                         action="store_true")
@@ -980,19 +1023,37 @@ def main():
             default=-1, type=int)
     parser.add_argument("--topp", help="TopP for sampling",
                         default=0.3, type=float)
+    parser.add_argument("--training", help="Enable generating training artifacts",
+                        action="store_true")
+    parser.add_argument("--partial", help="Export first N layers as the model.", type=int, default=None)
     parser.add_argument("pt_file",
                         help="A PyTorch file which contains state dict.")
     parser.add_argument("onnx_file",
                         help="The ONNX file name which will be saved.")
 
     args: argparse.Namespace = parser.parse_args()
-    model: onnx.ModelProto = make_model_from_state_dict(args)
-    if args.verbose:
-        print(model)
+    model: onnx.ModelProto
+    parameters: list[str]
+    model, parameters = make_model_from_state_dict(args)
+
     onnx.save_model(
-            model, args.onnx_file, save_as_external_data=True,
-            location=f"{args.onnx_file}.data")
-    onnx.checker.check_model(pathlib.Path(args.onnx_file), full_check=True)
+            model, args.onnx_file,
+            save_as_external_data=True, location=f"{args.onnx_file}.data")
+    if args.inline or args.training:
+        model = onnx.load_model(args.onnx_file, load_external_data=False)
+        # Inline rwkv opset functions
+        model = onnx.inliner.inline_local_functions(model)
+        # Inline specified default opset functions
+        model = onnx.inliner.inline_selected_functions(model, [("", "GroupNormalization")], inline_schema_functions=True)
+
+    if args.verbose:
+        print(onnx.printer.to_text(model))
+    onnx.save_model(model, args.onnx_file)
+
+    onnx.checker.check_model(args.onnx_file, full_check=True)
+
+    if args.training:
+        generate_training_artifacts(args, parameters)
 
 
 if __name__ == "__main__":
