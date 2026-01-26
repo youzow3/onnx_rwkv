@@ -591,20 +591,16 @@ def make_sampling(internal_dtype: int = onnx.TensorProto.FLOAT
             onnx.helper.make_node("Concat", ["B*T", "topk"], ["B*TK"], axis=0)
     ]
 
-    temperature: list[onnx.NodeProto] = [
-            onnx.helper.make_node("Div", ["x", "temp"], ["x_temp"]),
-            onnx.helper.make_node("Softmax", ["x_temp"], ["temp_softmax"])
-    ]
-
     topk: list[onnx.NodeProto] = [
-            onnx.helper.make_node("TopK", ["temp_softmax", "topk"],
-                                  ["topk_temp_softmax_", "topk_idx"]),
+            onnx.helper.make_node("Softmax", ["x"], ["x_softmax"]),
+            onnx.helper.make_node("TopK", ["x_softmax", "topk"],
+                                  ["x_softmax_topk_", "topk_idx"]),
             onnx.helper.make_node("Reshape",
                                   ["topk_idx", "B*TK"], ["topk_idx_bt"]),
-            onnx.helper.make_node("ReduceSum", ["topk_temp_softmax_", "[-1]"],
-                                  ["topk_temp_softmax_sum"]),
+            onnx.helper.make_node("ReduceSum", ["x_softmax_topk_", "[-1]"],
+                                  ["x_softmax_topk_sum"]),
             onnx.helper.make_node(
-                "Div", ["topk_temp_softmax_", "topk_temp_softmax_sum"],
+                "Div", ["x_softmax_topk_", "x_softmax_topk_sum"],
                 ["topk_scaled"])
     ]
 
@@ -627,15 +623,22 @@ def make_sampling(internal_dtype: int = onnx.TensorProto.FLOAT
                 ["topp_scaled"]),
     ]
 
+    temperature: list[onnx.NodeProto] = [
+            onnx.helper.make_node("Reciprocal", ["temp"], ["1/temp"]),
+            onnx.helper.make_node("Pow", ["topp_scaled", "1/temp"], ["topp_temp_"]),
+            onnx.helper.make_node("ReduceSum", ["topp_temp_", "[-1]"], ["topp_temp_sum"]),
+            onnx.helper.make_node("Div", ["topp_temp_", "topp_temp_sum"], ["topp_temp"]),
+    ]
+
     sampling: list[onnx.NodeProto] = [
             onnx.helper.make_node(
-                "Cast", ["topp_scaled"], ["topp_scaled_casted"],
+                "Cast", ["topp_temp"], ["topp_temp_casted"],
                 to=onnx.TensorProto.FLOAT),
-            onnx.helper.make_node("Reshape", ["topp_scaled_casted", "B*TK"],
-                                  ["topp_scaled_bt"]),
-            onnx.helper.make_node("Log", ["topp_scaled_bt"], ["topp_scaled_bt_log"]),
+            onnx.helper.make_node("Reshape", ["topp_temp_casted", "B*TK"],
+                                  ["topp_temp_casted_bt"]),
+            onnx.helper.make_node("Log", ["topp_temp_casted_bt"], ["topp_temp_casted_bt_log"]),
             onnx.helper.make_node(
-                "Multinomial", ["topp_scaled_bt_log"], ["sampled_idx_bt_"],
+                "Multinomial", ["topp_temp_casted_bt_log"], ["sampled_idx_bt_"],
                 dtype=onnx.TensorProto.INT64),
             onnx.helper.make_node(
                 "GatherElements", ["topk_idx_bt", "sampled_idx_bt_"], ["idx_bt"], axis=1),
@@ -644,7 +647,7 @@ def make_sampling(internal_dtype: int = onnx.TensorProto.FLOAT
 
     return onnx.helper.make_function(
             __domain, "sampling", ["x_", "temp_", "topk_", "topp_"], ["idx"],
-            constants + shapes + temperature + topk + topp + sampling,
+            constants + shapes + topk + topp + temperature + sampling,
             __opset_imports)
 
 
