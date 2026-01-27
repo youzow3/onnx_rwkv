@@ -15,9 +15,25 @@ ONNX-RWKV is a project to make RWKV series ONNX implementation. Since I started 
 
 ## Supported Sampling Methods
 
-- Temperature
+- Presence penalties
+    - Alpha Presence
+    - Alpha Frequency
+    - Alpha Decay
 - TopK
+- Temperature
 - TopP
+
+>
+> Default sampling parameter is same settings described at [this page](https://huggingface.co/BlinkDL/rwkv7-g1).
+>
+
+>
+> Sampling implementation is almost same as rwkv pip package. However:
+>
+> 1. Alpha presence penalty (occurence in this and the pip package code) is applied to all tokens instead of all tokens except digits and tabs.
+> 2. TopK can be applied because TopK is only way to get sorted logits which is needed to compute TopP.
+> 3. As the rwkv pip package does, temperature is applied after TopK and TopP, not before TopK and TopP.
+>
 
 ## Using models on Chatbot
 

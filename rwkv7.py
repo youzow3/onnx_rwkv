@@ -7,6 +7,8 @@ import argparse
 
 import pathlib
 
+from typing import Any
+
 __domain: str = "rwkv7"
 __opset_imports: list[onnx.OperatorSetIdProto] = [
     onnx.helper.make_opsetid("", 21),
@@ -565,8 +567,7 @@ def make_block() -> list[onnx.FunctionProto]:
     ]
 
 
-def make_sampling(
-        internal_dtype: int = onnx.TensorProto.FLOAT) -> onnx.FunctionProto:
+def make_sampling() -> onnx.FunctionProto:
     constants: list[onnx.NodeProto] = [
         onnx.helper.make_node("Constant", [], ["[-1]"], value_ints=[-1]),
         onnx.helper.make_node("Constant", [], ["[0]"], value_ints=[0]),
@@ -575,12 +576,14 @@ def make_sampling(
         onnx.helper.make_node("Constant", [], ["[3]"], value_ints=[3]),
         onnx.helper.make_node("Constant", [], ["-1"], value_int=-1),
         onnx.helper.make_node("Constant", [], ["0"], value_int=0),
+        onnx.helper.make_node("Constant", [], ["0.0"], value_float=0.0),
         onnx.helper.make_node("Constant", [], ["starts"], value_ints=[0, 0,
                                                                       0]),
-        onnx.helper.make_node("Cast", ["x_"], ["x"], to=internal_dtype),
-        onnx.helper.make_node("Cast", ["temp_"], ["temp"], to=internal_dtype),
-        onnx.helper.make_node("Unsqueeze", ["topk_", "0"], ["topk"]),
-        onnx.helper.make_node("Cast", ["topp_"], ["topp"], to=internal_dtype)
+        onnx.helper.make_node("Constant", [], ["onehot_value"],
+                              value_floats=[0.0, 1.0]),
+        onnx.helper.make_node("Cast", ["x_"], ["x"],
+                              to=onnx.TensorProto.FLOAT),
+        onnx.helper.make_node("Unsqueeze", ["topk_", "0"], ["topk"])
     ]
 
     shapes: list[onnx.NodeProto] = [
@@ -596,8 +599,24 @@ def make_sampling(
         onnx.helper.make_node("Concat", ["B*T", "topk"], ["B*TK"], axis=0)
     ]
 
+    alpha: list[onnx.NodeProto] = [
+        onnx.helper.make_node("Greater", ["occurence", "0.0"],
+                              ["occurence_filter"]),
+        onnx.helper.make_node("Where",
+                              ["occurence_filter", "alpha_presence", "0.0"],
+                              ["presence_penalty"]),
+        onnx.helper.make_node("Mul", ["occurence", "alpha_frequency"],
+                              ["frequency_penalty"]),
+        onnx.helper.make_node("Add", ["presence_penalty", "frequency_penalty"],
+                              ["penalty_"]),
+        onnx.helper.make_node("Unsqueeze", ["penalty_", "[1]"], ["penalty"]),
+        onnx.helper.make_node("Sub", ["x", "penalty"], ["x_alpha"]),
+        onnx.helper.make_node("Mul", ["occurence", "alpha_decay"],
+                              ["occurence_next_"])
+    ]
+
     topk: list[onnx.NodeProto] = [
-        onnx.helper.make_node("Softmax", ["x"], ["x_softmax"]),
+        onnx.helper.make_node("Softmax", ["x_alpha"], ["x_softmax"]),
         onnx.helper.make_node("TopK", ["x_softmax", "topk"],
                               ["x_softmax_topk_", "topk_idx"]),
         onnx.helper.make_node("Reshape", ["topk_idx", "B*TK"],
@@ -609,14 +628,12 @@ def make_sampling(
     ]
 
     topp: list[onnx.NodeProto] = [
-        onnx.helper.make_node("Cast", ["0"], ["0_casted"], to=internal_dtype),
         onnx.helper.make_node("CumSum", ["topk_scaled", "[-1]"],
                               ["topk_scaled_cumsum"],
                               exclusive=1),
         onnx.helper.make_node("GreaterOrEqual", ["topk_scaled_cumsum", "topp"],
                               ["topp_filter"]),
-        onnx.helper.make_node("Where",
-                              ["topp_filter", "0_casted", "topk_scaled"],
+        onnx.helper.make_node("Where", ["topp_filter", "0.0", "topk_scaled"],
                               ["topp_topk_scaled"]),
         onnx.helper.make_node("ReduceSum", ["topp_topk_scaled", "[-1]"],
                               ["topp_topk_scaled_sum"]),
@@ -648,12 +665,21 @@ def make_sampling(
         onnx.helper.make_node("GatherElements",
                               ["topk_idx_bt", "sampled_idx_bt_"], ["idx_bt"],
                               axis=1),
-        onnx.helper.make_node("Reshape", ["idx_bt", "BT"], ["idx"])
+        onnx.helper.make_node("Reshape", ["idx_bt", "BT"], ["idx"]),
+        onnx.helper.make_node("OneHot", ["idx", "V", "onehot_value"],
+                              ["onehot_"]),
+        onnx.helper.make_node("ReduceSum", ["onehot_", "[1]"], ["onehot"],
+                              keepdims=0),
+        onnx.helper.make_node("Add", ["occurence_next_", "onehot"],
+                              ["occurence_next"])
     ]
 
     return onnx.helper.make_function(
-        __domain, "sampling", ["x_", "temp_", "topk_", "topp_"], ["idx"],
-        constants + shapes + topk + topp + temperature + sampling,
+        __domain, "sampling", [
+            "x_", "occurence", "alpha_presence", "alpha_frequency",
+            "alpha_decay", "temp", "topk_", "topp"
+        ], ["idx", "occurence_next"],
+        constants + shapes + alpha + topk + topp + temperature + sampling,
         __opset_imports)
 
 
@@ -963,26 +989,40 @@ def make_model_from_state_dict(
         y_value_infos.append(
             onnx.helper.make_tensor_value_info("y", onnx.TensorProto.INT64,
                                                ["batch", "seq"]))
+        y_value_infos.append(
+            onnx.helper.make_tensor_value_info("occurence_next",
+                                               onnx.TensorProto.FLOAT,
+                                               ["batch", vocab_size]))
+        occurence_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
+            "occurence", onnx.TensorProto.FLOAT, ["batch", vocab_size])
         if args.sampling_with_head:
             y_value_infos.append(head_value_info)
 
         sampling: list[onnx.NodeProto] = [
+            onnx.helper.make_node("Constant", [], ["alpha_presence"],
+                                  value_float=args.alpha_presence),
+            onnx.helper.make_node("Constant", [], ["alpha_frequency"],
+                                  value_float=args.alpha_frequency),
+            onnx.helper.make_node("Constant", [], ["alpha_decay"],
+                                  value_float=args.alpha_decay),
             onnx.helper.make_node("Constant", [], ["temperature"],
                                   value_float=args.temperature),
             onnx.helper.make_node("Constant", [], ["topk"],
                                   value_int=args.topk),
             onnx.helper.make_node("Constant", [], ["topp"],
                                   value_float=args.topp),
-            onnx.helper.make_node("sampling",
-                                  ["head", "temperature", "topk", "topp"],
-                                  ["y"],
+            onnx.helper.make_node("sampling", [
+                "head", "occurence", "alpha_presence", "alpha_frequency",
+                "alpha_decay", "temperature", "topk", "topp"
+            ], ["y", "occurence_next"],
                                   domain=__domain)
         ]
-        sampling_function.append(make_sampling(torch_onnx_dtype[main_dtype]))
+        sampling_function.append(make_sampling())
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
             list(parameters.values()) + [emb] + semb + blocks +
             [ln_out, head] + sampling,
-            "RWKV7-LM", [x_value_info] + state_value_infos,
+            "RWKV7-LM",
+            [x_value_info] + state_value_infos + [occurence_value_info],
             y_value_infos + next_value_infos,
             initializer=list(tensor_proto_state_dict.values()),
             value_info=list(type_proto_state_dict.values()))
@@ -1077,9 +1117,21 @@ def main():
                         help="Outputs both token id and logit",
                         action="store_true")
     parser.add_argument("--inline", help="", action="store_true")
+    parser.add_argument("--alpha_presence",
+                        help="Presence penalty",
+                        default=2.0,
+                        type=float),
+    parser.add_argument("--alpha_frequency",
+                        help="Frequency penalty",
+                        default=0.1,
+                        type=float),
+    parser.add_argument("--alpha_decay",
+                        help="Frequency penalty decay",
+                        default=0.99,
+                        type=float),
     parser.add_argument("--temperature",
                         help="temperature for sampling",
-                        default=0.3,
+                        default=1.0,
                         type=float)
     parser.add_argument("--topk",
                         help="TopK for sampling, -1 to disable",
@@ -1087,7 +1139,7 @@ def main():
                         type=int)
     parser.add_argument("--topp",
                         help="TopP for sampling",
-                        default=0.3,
+                        default=0.5,
                         type=float)
     parser.add_argument("--training",
                         help="Enable generating training artifacts",
