@@ -35,24 +35,36 @@ ONNX-RWKV is a project to make RWKV series ONNX implementation. Since I started 
 > 3. As the rwkv pip package does, temperature is applied after TopK and TopP, not before TopK and TopP.
 >
 
+## Supported Training Methods
+
+- SFT
+- REINFORCE (token level reward)
+
+>
+> Both type receive "mask" INT64 tensor (batch, seq), which is used to mask pad token.
+>
+> REINFORCE also receives "reward" FLOAT tensor (batch, seq), which is token level reward.
+>
+
+To use SFT, just use --training flag.
+To use REINFORCE, specify --training and --rl flags.
+
+>
+> Model generation is done with [my custom onnxruntime](https://github.com/youzow3/onnxruntime). Merge main, controlflow, and transpose_fix.
+>
+
+Training model generation is tested with rwkv7-g1-0.1b, rwkv7-g1c-1.5b, and rwkv7-g1d-2.9b. However, none of them are actually tested with ONNXRuntime Training API to train.
+
 ## Using models on Chatbot
 
 [Chatbot](https://github.com/youzow3/chatbot) is my current test environment. If you want to use RWKV on the program, you need to specify -s to generate sampling included ONNX file, which is required for my RWKV Module for Chatbot. (See rwkv.c on the repo.)
-
-Default hyperparameters for sampling are temperature: 0.3, TopK: vocab_size, and TopP: 0.3.
 
 I tested fp32 RWKV-7 G1 0.1b, and fp32 RWKV-7a G1b 0.1b.
 
 ## NOTE
 
-I used Python 3.12 for this script.
-
-Lots of implementation problem still exists.
+Implementation problem may still exist.
 
 ~~Example code in C is available at cli-chat/.~~
 
 The example code still available, but I recommend using Chatbot.
-
-## MEMO
-
-onnxruntime-training works in Python 3.11, not 3.12

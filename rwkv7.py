@@ -5,8 +5,6 @@ import numpy as np
 import torch
 import argparse
 
-import pathlib
-
 from typing import Any
 
 __domain: str = "rwkv7"
@@ -799,6 +797,9 @@ def make_model_from_state_dict(
         if not k.startswith("blocks.0.") and (k.endswith("ln0.weight")
                                               or k.endswith("ln0.bias")):
             continue  # Skip unused parameters to avoid potential bugs
+        if k.startswith("blocks.0.") and (k.endswith("v0") or k.endswith("v1")
+                                          or k.endswith("v2")):
+            continue
         tensor: np.ndarray = state_dict[k].detach().cpu().to(
             torch.float).numpy()
         tensor_proto_state_dict[k] = onnx.numpy_helper.from_array(
@@ -995,7 +996,7 @@ def make_model_from_state_dict(
                                                ["batch", vocab_size]))
         occurence_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
             "occurence", onnx.TensorProto.FLOAT, ["batch", vocab_size])
-        if args.sampling_with_head:
+        if args.sampling_with_head or args.training:
             y_value_infos.append(head_value_info)
 
         sampling: list[onnx.NodeProto] = [
@@ -1051,26 +1052,78 @@ def make_model_from_state_dict(
 
 def generate_training_artifacts(args: argparse.Namespace,
                                 parameters: list[str]) -> None:
-    import onnxruntime as ort
     import onnxruntime.training.onnxblock as onnxblock
-    from onnxruntime.training.artifacts import generate_artifacts, LossType, OptimType
+    import onnxruntime.training.onnxblock.blocks as blocks
 
-    class ModelLoss(onnxblock.TrainingBlock):
+    class SFTLoss(onnxblock.TrainingBlock):
 
         def __init__(self):
             super().__init__()
-            self.loss_fn: onnxblock.Block = onnxblock.loss.CrossEntropyLoss()
+            self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
+            self.cast: onnxblock.Block = blocks.Cast(onnx.TensorProto.FLOAT)
+            self.loss_fn: onnxblock.Block = onnxblock.loss.CrossEntropyLoss(
+                reduction="none")
+            self.inputlike: onnxblock.Block = blocks.InputLike("x")
+            self.mul: onnxblock.Block = blocks.Mul()
+            self.div: onnxblock.Block = blocks.Div()
+            self.sum: onnxblock.Block = blocks.ReduceSum(keepdims=False)
 
         def build(self, logit: str) -> str:
-            return self.loss_fn(logit, "y_actual")
+            self.base.graph.initializer.append(
+                onnx.helper.make_tensor("loss_pad", onnx.TensorProto.INT64,
+                                        [4], [0, 0, -1, 1]))
+            x_padded: str = self.pad("x", "loss_pad")
+            logit_casted: str = self.cast(logit)
+            loss: str = self.loss_fn(logit_casted, x_padded)
+            mask: str = self.inputlike("mask")
+            mask_casted: str = self.cast(mask)
+            loss_masked: str = self.mul(loss, mask_casted)
+            loss_masked_sum: str = self.sum(loss_masked)
+            mask_sum: str = self.sum(mask_casted)
+            return self.div(loss_masked_sum, mask_sum)
 
-    loss: onnxblock.TrainingBlock = ModelLoss()
-    model: onnx.ModelProto = onnx.load_model(args.onnx_file)
+    class RLLoss(onnxblock.TrainingBlock):
+
+        def __init__(self):
+            super().__init__()
+            self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
+            self.cast: onnxblock.Block = blocks.Cast(onnx.TensorProto.FLOAT)
+            self.loss_fn: onnxblock.Block = onnxblock.loss.CrossEntropyLoss(
+                reduction="none")
+            self.inputlike: onnxblock.Block = blocks.InputLike("x")
+            self.mul: onnxblock.Block = blocks.Mul()
+            self.div: onnxblock.Block = blocks.Div()
+            self.sum: onnxblock.Block = blocks.ReduceSum(keepdims=False)
+
+        def build(self, logit: str) -> str:
+            self.base.graph.initializer.append(
+                onnx.helper.make_tensor("loss_pad", onnx.TensorProto.INT64,
+                                        [4], [0, 0, -1, 1]))
+            x_padded: str = self.pad("x", "loss_pad")
+            logit_casted: str = self.cast(logit)
+            loss: str = self.loss_fn(logit_casted, x_padded)
+            mask: str = self.inputlike("mask")
+            mask_casted: str = self.cast(mask)
+            loss_masked: str = self.mul(loss, mask_casted)
+            reward: str = self.inputlike("reward")
+            reward_value_info: onnx.ValueInfoProto = self.base.graph.input[-1]
+            assert reward_value_info.name == "reward"
+            reward_value_info.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+            rewarded_loss: str = self.mul(reward, loss_masked)
+            rewarded_loss_sum: str = self.sum(rewarded_loss)
+            mask_sum: str = self.sum(mask_casted)
+            return self.div(rewarded_loss_sum, mask_sum)
+
+    loss: onnxblock.TrainingBlock
+    if args.rl:
+        loss = RLLoss()
+    else:
+        loss = SFTLoss()
+    model: onnx.ModelProto = onnx.load_model(args.onnx_file,
+                                             load_external_data=False)
     for initializer in model.graph.initializer:
         name: str = initializer.name
         loss.requires_grad(name, name in parameters)
-
-    optimizer: onnxblock.ForwardBlock = onnxblock.optim.SGD()
 
     training_model: onnx.ModelProto
     eval_model: onnx.ModelProto
@@ -1080,7 +1133,12 @@ def generate_training_artifacts(args: argparse.Namespace,
         training_model, eval_model = loss.to_model_proto()
         model_params = loss.parameters()
 
-    optimizer: onnxblock.ForwardBlock = onnxblock.optim.SGD()
+    clip_grad: onnxblock.Block = onnxblock.optim.ClipGradNorm(args.clip_grad)
+    optimizer: onnxblock.ForwardBlock = onnxblock.optim.AdamW(
+        betas=[args.beta1, args.beta2],
+        eps=args.adam_eps,
+        weight_decay=0,
+        clip_grad=clip_grad)
     optimizer_model: onnx.ModelProto
     with onnxblock.empty_base():
         _ = optimizer(model_params)
@@ -1144,6 +1202,25 @@ def main():
     parser.add_argument("--training",
                         help="Enable generating training artifacts",
                         action="store_true")
+    parser.add_argument("--rl",
+                        help="Using RL type loss instead of SFT type",
+                        action="store_true")
+    parser.add_argument("--beta1",
+                        help="beta1 for Adam",
+                        default=0.9,
+                        type=float)
+    parser.add_argument("--beta2",
+                        help="beta2 for Adam",
+                        default=0.99,
+                        type=float)
+    parser.add_argument("--adam_eps",
+                        help="eps for Adam",
+                        default=1e-18,
+                        type=float)
+    parser.add_argument("--clip_grad",
+                        help="gradient clipping",
+                        default=0.1,
+                        type=float)
     parser.add_argument("--partial",
                         help="Export first N layers as the model.",
                         type=int,
