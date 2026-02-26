@@ -1082,8 +1082,7 @@ def generate_training_artifacts(args: argparse.Namespace,
             mask_sum: str = self.sum(mask_casted)
             return self.div(loss_masked_sum, mask_sum)
 
-    class RLLoss(onnxblock.TrainingBlock):
-
+    class REINFORCELoss(onnxblock.TrainingBlock):
         def __init__(self):
             super().__init__()
             self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
@@ -1114,9 +1113,36 @@ def generate_training_artifacts(args: argparse.Namespace,
             mask_sum: str = self.sum(mask_casted)
             return self.div(rewarded_loss_sum, mask_sum)
 
+    class SDPOLoss(onnxblock.TrainingBlock):
+        def __init__(self):
+            super().__init__()
+            self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
+            self.cast: onnxblock.Block = blocks.Cast(onnx.TensorProto.FLOAT)
+            self.inputlike_x: onnxblock.Block = blocks.InputLike("x")
+            self.inputlike_head: onnxblock.Block = blocks.InputLike("head")
+            self.softmax: onnxblock.Block = blocks._UnaryOp("Softmax")
+            self.unsqueeze: onnxblock.Block = blocks._BinaryOp("Unsqueeze")
+            self.sub: onnxblock.Block = blocks.Sub()
+            self.mul: onnxblock.Block = blocks.Mul()
+            self.div: onnxblock.Block = blocks.Div()
+            self.sum: onnxblock.Block = blocks.ReduceSum(keepdims=False)
+
+        def build(self, logit: str) -> str:
+            logit_casted: str = self.cast(logit)
+            teacher_logit: str = self.cast(self.inputlike_head("teacher_logit"))
+            teacher_logit_casted: str = self.cast(teacher_logit)
+            loss: str = self.mul(self.softmax(logit_casted), self.sub(logit_casted, teacher_logit_casted))
+            mask: str = self.inputlike_x("mask")
+            mask_casted_: str = self.cast(mask)
+            mask_casted: str = self.unsqueeze(mask_casted_, "[2]") # (B, T) to (B, T, 1)
+            loss_masked: str = self.mul(loss, mask_casted)
+            loss_sum: str = self.sum(loss_masked)
+            mask_sum: str = self.sum(mask_casted)
+            return self.div(loss_sum, mask_sum)
+
     loss: onnxblock.TrainingBlock
     if args.rl:
-        loss = RLLoss()
+        loss = REINFORCELoss()
     else:
         loss = SFTLoss()
     model: onnx.ModelProto = onnx.load_model(args.onnx_file,
@@ -1205,6 +1231,7 @@ def main():
     parser.add_argument("--rl",
                         help="Using RL type loss instead of SFT type",
                         action="store_true")
+    parser.add_argument("--sdpo", help="Using SDPO style loss instead of REINFORCE loss for RL mode", action="store_true")
     parser.add_argument("--beta1",
                         help="beta1 for Adam",
                         default=0.9,
