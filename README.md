@@ -39,6 +39,7 @@ ONNX-RWKV is a project to make RWKV series ONNX implementation. Since I started 
 
 - SFT
 - REINFORCE (token level reward)
+- SDPO (logit distilation)
 
 >
 > Both type receive "mask" INT64 tensor (batch, seq), which is used to mask pad token.
@@ -53,7 +54,9 @@ To use REINFORCE, specify --training and --rl flags.
 > Model generation is done with [my custom onnxruntime](https://github.com/youzow3/onnxruntime). Merge main, controlflow, and transpose_fix.
 >
 
-Training model generation is tested with rwkv7-g1-0.1b, rwkv7-g1c-1.5b, and rwkv7-g1d-2.9b. However, none of them are actually tested with ONNXRuntime Training API to train.
+Training model generation is tested with rwkv7-g1-0.1b, rwkv7-g1c-1.5b, and rwkv7-g1d-2.9b. ~~However, none of them are actually tested with ONNXRuntime Training API to train.~~
+
+- SFT method is tested with rwkv7-g1d-0.1b. (Also, REINFORCE and SDPO seems not work in current status)
 
 ## Using models on Chatbot
 
