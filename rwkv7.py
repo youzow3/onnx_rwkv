@@ -14,9 +14,31 @@ __opset_imports: list[onnx.OperatorSetIdProto] = [
 ]
 
 
-def make_tensor(tensor: torch.Tensor, name: str | None) -> onnx.TensorProto:
-    return onnx.numpy_helper.from_array(tensor.to(torch.float).numpy(),
-                                        name=name)
+def make_fallback(dtype: int, suffix: str) -> onnx.FunctionProto:
+    unwrap: onnx.NodeProto = onnx.helper.make_node("OptionalGetElement",
+                                                   ["optional"], ["output"])
+    fallback: onnx.NodeProto = onnx.helper.make_node(
+        "Expand", ["fallback", "fallback_shape"], ["output"])
+    output: onnx.TypeProto = onnx.helper.make_tensor_type_proto(dtype, None)
+    optional: onnx.TypeProto = onnx.helper.make_optional_type_proto(output)
+    unwrap_graph: onnx.GraphProto = onnx.helper.make_graph(
+        [unwrap], "unwrap_graph", [],
+        [onnx.helper.make_value_info("output", output)])
+    fallback_graph: onnx.GraphProto = onnx.helper.make_graph(
+        [fallback], "fallback_graph", [],
+        [onnx.helper.make_value_info("output", output)])
+
+    optional_provided: onnx.NodeProto = onnx.helper.make_node(
+        "OptionalHasElement", ["optional"], ["optional_provided"])
+    get_value: onnx.NodeProto = onnx.helper.make_node(
+        "If", ["optional_provided"], ["output"],
+        else_branch=fallback_graph,
+        then_branch=unwrap_graph)
+
+    return onnx.helper.make_function(
+        __domain, f"fallback_{suffix}",
+        ["optional", "fallback", "fallback_shape"], ["output"],
+        [optional_provided, get_value], __opset_imports)
 
 
 def make_normalize() -> onnx.FunctionProto:
@@ -755,6 +777,12 @@ def make_model_from_state_dict(
     # Is using DeepEmbed
     is_deepemb: bool = "blocks.0.ffn.s_emb.weight" in state_dict.keys()
 
+    fallback_functions: list[onnx.FunctionProto] = [
+        make_fallback(torch_onnx_dtype[dtype], suffix)
+        for dtype, suffix in [(main_dtype,
+                               "main"), (wkv_dtype,
+                                         "wkv"), (torch.float, "float")]
+    ]
     normalize_function: onnx.FunctionProto = make_normalize()
     time_shift_function: onnx.FunctionProto = make_time_shift()
     linear_function: onnx.FunctionProto = make_linear()
@@ -814,21 +842,71 @@ def make_model_from_state_dict(
     head_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
         "head", onnx_main_dtype, ["batch", "seq", vocab_size])
     state_value_infos: list[onnx.ValueInfoProto] = []
+    state_optional_nodes: list[onnx.NodeProto] = [
+        onnx.helper.make_node("Shape", ["x"], ["B"], start=0, end=1),
+        onnx.helper.make_node("Concat", ["B", "1C"], ["B1C"], axis=0),
+        onnx.helper.make_node("Concat", ["B", "HNN"], ["BHNN"], axis=0)
+    ]
+    state_tensor_proto: list[onnx.TensorProto] = [
+        onnx.helper.make_tensor("1C", onnx.TensorProto.INT64, [2], [1, dim]),
+        onnx.helper.make_tensor("HNN", onnx.TensorProto.INT64, [3],
+                                [n_head, head_size, head_size])
+    ]
     next_value_infos: list[onnx.ValueInfoProto] = []
 
     for i in range(nlayers):
         state_value_infos.append(
-            onnx.helper.make_tensor_value_info(f"x_tmix_last_{i}",
-                                               onnx_main_dtype,
-                                               ["batch", 1, dim]))
+            onnx.helper.make_value_info(
+                f"x_tmix_last_{i}_opt",
+                onnx.helper.make_optional_type_proto(
+                    onnx.helper.make_tensor_type_proto(onnx_main_dtype,
+                                                       ["batch", 1, dim]))))
+        state_tensor_proto.append(
+            onnx.numpy_helper.from_array(
+                np.zeros((1, 1, dim), np_dtype_table[main_dtype]),
+                f"x_tmix_last_{i}_0"))
+        state_optional_nodes += [
+            onnx.helper.make_node(
+                "fallback_main",
+                [f"x_tmix_last_{i}_opt", f"x_tmix_last_{i}_0", "B1C"],
+                [f"x_tmix_last_{i}"],
+                domain=__domain)
+        ]
         state_value_infos.append(
-            onnx.helper.make_tensor_value_info(
-                f"wkv_state_{i}", onnx_wkv_dtype,
-                ["batch", n_head, head_size, head_size]))
+            onnx.helper.make_value_info(
+                f"wkv_state_{i}_opt",
+                onnx.helper.make_optional_type_proto(
+                    onnx.helper.make_tensor_type_proto(
+                        onnx_wkv_dtype,
+                        ["batch", n_head, head_size, head_size]))))
+        state_tensor_proto.append(
+            onnx.numpy_helper.from_array(
+                np.zeros((1, n_head, head_size, head_size),
+                         np_dtype_table[wkv_dtype]), f"wkv_state_{i}_0"))
+        state_optional_nodes += [
+            onnx.helper.make_node(
+                "fallback_wkv",
+                [f"wkv_state_{i}_opt", f"wkv_state_{i}_0", "BHNN"],
+                [f"wkv_state_{i}"],
+                domain=__domain)
+        ]
         state_value_infos.append(
-            onnx.helper.make_tensor_value_info(f"x_cmix_last_{i}",
-                                               onnx_main_dtype,
-                                               ["batch", 1, dim]))
+            onnx.helper.make_value_info(
+                f"x_cmix_last_{i}_opt",
+                onnx.helper.make_optional_type_proto(
+                    onnx.helper.make_tensor_type_proto(onnx_main_dtype,
+                                                       ["batch", 1, dim]))))
+        state_tensor_proto.append(
+            onnx.numpy_helper.from_array(
+                np.zeros((1, 1, dim), np_dtype_table[main_dtype]),
+                f"x_cmix_last_{i}_0"))
+        state_optional_nodes += [
+            onnx.helper.make_node(
+                "fallback_main",
+                [f"x_cmix_last_{i}_opt", f"x_cmix_last_{i}_0", "B1C"],
+                [f"x_cmix_last_{i}"],
+                domain=__domain)
+        ]
         next_value_infos.append(
             onnx.helper.make_tensor_value_info(f"x_tmix_next_{i}",
                                                onnx_main_dtype,
@@ -994,8 +1072,11 @@ def make_model_from_state_dict(
             onnx.helper.make_tensor_value_info("occurence_next",
                                                onnx.TensorProto.FLOAT,
                                                ["batch", vocab_size]))
-        occurence_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
-            "occurence", onnx.TensorProto.FLOAT, ["batch", vocab_size])
+        occurence_value_info: onnx.ValueInfoProto = onnx.helper.make_value_info(
+            "occurence_opt",
+            onnx.helper.make_optional_type_proto(
+                onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT,
+                                                   ["batch", vocab_size])))
         if args.sampling_with_head or args.training:
             y_value_infos.append(head_value_info)
 
@@ -1012,6 +1093,18 @@ def make_model_from_state_dict(
                                   value_int=args.topk),
             onnx.helper.make_node("Constant", [], ["topp"],
                                   value_float=args.topp),
+            onnx.helper.make_node("Constant", [], ["occurence_0"],
+                                  value_float=0.0),
+            onnx.helper.make_node("Constant", [], ["occurence_shape_1"],
+                                  value_ints=[vocab_size]),
+            onnx.helper.make_node("Concat", ["B", "occurence_shape_1"],
+                                  ["occurence_shape"],
+                                  axis=0),
+            onnx.helper.make_node(
+                "fallback_float",
+                ["occurence_opt", "occurence_0", "occurence_shape"],
+                ["occurence"],
+                domain=__domain),
             onnx.helper.make_node("sampling", [
                 "head", "occurence", "alpha_presence", "alpha_frequency",
                 "alpha_decay", "temperature", "topk", "topp"
@@ -1020,25 +1113,28 @@ def make_model_from_state_dict(
         ]
         sampling_function.append(make_sampling())
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
-            list(parameters.values()) + [emb] + semb + blocks +
-            [ln_out, head] + sampling,
+            list(parameters.values()) + state_optional_nodes + [emb] + semb +
+            blocks + [ln_out, head] + sampling,
             "RWKV7-LM",
             [x_value_info] + state_value_infos + [occurence_value_info],
             y_value_infos + next_value_infos,
-            initializer=list(tensor_proto_state_dict.values()),
+            initializer=list(tensor_proto_state_dict.values()) +
+            state_tensor_proto,
             value_info=list(type_proto_state_dict.values()))
     else:
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
-            list(parameters.values()) + [emb] + semb + blocks + [ln_out, head],
+            list(parameters.values()) + state_optional_nodes + [emb] + semb +
+            blocks + [ln_out, head],
             "RWKV7-LM", [x_value_info] + state_value_infos,
             [head_value_info] + next_value_infos,
-            initializer=list(tensor_proto_state_dict.values()),
+            initializer=list(tensor_proto_state_dict.values()) +
+            state_tensor_proto,
             value_info=list(type_proto_state_dict.values()))
 
     rwkv_lm_model: onnx.ModelProto = onnx.helper.make_model(
         rwkv_lm,
         opset_imports=__opset_imports,
-        functions=[
+        functions=fallback_functions + [
             normalize_function, time_shift_function, lerp_function,
             linear_function
         ] + loramlp_functions + [wkv7_function] + time_mix_functions +
@@ -1055,12 +1151,22 @@ def generate_training_artifacts(args: argparse.Namespace,
     import onnxruntime.training.onnxblock as onnxblock
     import onnxruntime.training.onnxblock.blocks as blocks
 
+    model: onnx.ModelProto = onnx.load_model(args.onnx_file,
+                                             load_external_data=False)
+    emb_weight: onnx.TensorProto = None
+    vocab_size: int = -1
+    for t in model.graph.initializer:
+        if t.name == "emb.weight":
+            vocab_size = int(t.dims[0])
+    assert vocab_size != -1
+
     class SFTLoss(onnxblock.TrainingBlock):
 
         def __init__(self):
             super().__init__()
             self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
             self.cast: onnxblock.Block = blocks.Cast(onnx.TensorProto.FLOAT)
+            self.reshape: onnxblock.Block = blocks._BinaryOp("Reshape")
             self.loss_fn: onnxblock.Block = onnxblock.loss.CrossEntropyLoss(
                 reduction="none")
             self.inputlike: onnxblock.Block = blocks.InputLike("x")
@@ -1070,19 +1176,31 @@ def generate_training_artifacts(args: argparse.Namespace,
 
         def build(self, logit: str) -> str:
             self.base.graph.initializer.append(
-                onnx.helper.make_tensor("loss_pad", onnx.TensorProto.INT64,
-                                        [4], [0, 0, -1, 1]))
+                onnx.numpy_helper.from_array(
+                    np.array([0, -1, 0, 1], dtype=np.int64), "loss_pad"))
             x_padded: str = self.pad("x", "loss_pad")
             logit_casted: str = self.cast(logit)
-            loss: str = self.loss_fn(logit_casted, x_padded)
+            self.base.graph.initializer.append(
+                onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64),
+                                             "x_flatten_shape"))
+            self.base.graph.initializer.append(
+                onnx.numpy_helper.from_array(
+                    np.array([-1, vocab_size], dtype=np.int64),
+                    "logit_flatten_shape"))
+            logit_flattened: str = self.reshape(logit_casted,
+                                                "logit_flatten_shape")
+            x_flattened: str = self.reshape(x_padded, "x_flatten_shape")
+            loss: str = self.loss_fn(logit_flattened, x_flattened)
             mask: str = self.inputlike("mask")
             mask_casted: str = self.cast(mask)
-            loss_masked: str = self.mul(loss, mask_casted)
+            mask_flattened: str = self.reshape(mask_casted, "x_flatten_shape")
+            loss_masked: str = self.mul(loss, mask_flattened)
             loss_masked_sum: str = self.sum(loss_masked)
-            mask_sum: str = self.sum(mask_casted)
+            mask_sum: str = self.sum(mask_flattened)
             return self.div(loss_masked_sum, mask_sum)
 
     class REINFORCELoss(onnxblock.TrainingBlock):
+
         def __init__(self):
             super().__init__()
             self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
@@ -1129,12 +1247,15 @@ def generate_training_artifacts(args: argparse.Namespace,
 
         def build(self, logit: str) -> str:
             logit_casted: str = self.cast(logit)
-            teacher_logit: str = self.cast(self.inputlike_head("teacher_logit"))
+            teacher_logit: str = self.cast(
+                self.inputlike_head("teacher_logit"))
             teacher_logit_casted: str = self.cast(teacher_logit)
-            loss: str = self.mul(self.softmax(logit_casted), self.sub(logit_casted, teacher_logit_casted))
+            loss: str = self.mul(self.softmax(logit_casted),
+                                 self.sub(logit_casted, teacher_logit_casted))
             mask: str = self.inputlike_x("mask")
             mask_casted_: str = self.cast(mask)
-            mask_casted: str = self.unsqueeze(mask_casted_, "[2]") # (B, T) to (B, T, 1)
+            mask_casted: str = self.unsqueeze(mask_casted_,
+                                              "[2]")  # (B, T) to (B, T, 1)
             loss_masked: str = self.mul(loss, mask_casted)
             loss_sum: str = self.sum(loss_masked)
             mask_sum: str = self.sum(mask_casted)
@@ -1145,8 +1266,6 @@ def generate_training_artifacts(args: argparse.Namespace,
         loss = REINFORCELoss()
     else:
         loss = SFTLoss()
-    model: onnx.ModelProto = onnx.load_model(args.onnx_file,
-                                             load_external_data=False)
     for initializer in model.graph.initializer:
         name: str = initializer.name
         loss.requires_grad(name, name in parameters)
@@ -1159,11 +1278,49 @@ def generate_training_artifacts(args: argparse.Namespace,
         training_model, eval_model = loss.to_model_proto()
         model_params = loss.parameters()
 
+    # make initializer for state gradients
+    for k in model.graph.output:
+        tensor_type: onnx.TypeProto.Tensor
+        if k.type.WhichOneof("value") == "optional_type":
+            tensor_type = k.type.optional_type.elem_type.tensor_type
+        else:
+            tensor_type = k.type.tensor_type
+
+        dtype_table: dict[int, np.dtype] = {
+            onnx.TensorProto.FLOAT: np.float32,
+            onnx.TensorProto.FLOAT16: np.float16,
+            onnx.TensorProto.BFLOAT16: ml_dtypes.bfloat16,
+        }
+
+        if k.name.startswith("wkv_next_"):
+            dim: list[int] = [d.dim_value for d in tensor_type.shape.dim]
+            dim[0] = 1  # does need batch size from x?
+            tensor: np.ndarray = np.zeros(dim,
+                                          dtype_table[tensor_type.elem_type])
+            training_model.graph.initializer.append(
+                onnx.numpy_helper.from_array(tensor, k.name + "_grad"))
+
+    # make input order (x, mask, states...) instead of (x, states..., mask)
+    mask_idx: int = None
+    for idx, i in enumerate(training_model.graph.input):
+        if i.name == "mask":
+            mask_idx = idx
+            break
+    assert isinstance(mask_idx, int)
+    input_len: int = len(training_model.graph.input)
+    training_model.graph.input.extend(
+        [training_model.graph.input[0], training_model.graph.input[mask_idx]])
+    training_model.graph.input.extend(training_model.graph.input[1:mask_idx])
+    training_model.graph.input.extend(training_model.graph.input[mask_idx +
+                                                                 1:input_len])
+    del training_model.graph.input[:input_len]
+    assert len(training_model.graph.input) == input_len
+
     clip_grad: onnxblock.Block = onnxblock.optim.ClipGradNorm(args.clip_grad)
     optimizer: onnxblock.ForwardBlock = onnxblock.optim.AdamW(
         betas=[args.beta1, args.beta2],
         eps=args.adam_eps,
-        weight_decay=0,
+        weight_decay=0.0,
         clip_grad=clip_grad)
     optimizer_model: onnx.ModelProto
     with onnxblock.empty_base():
@@ -1173,10 +1330,12 @@ def generate_training_artifacts(args: argparse.Namespace,
     onnxblock.save_checkpoint(model_params, f"checkpoint-{args.onnx_file}")
     onnx.save_model(training_model,
                     f"training-{args.onnx_file}",
-                    save_as_external_data=True)
+                    save_as_external_data=True,
+                    location=f"training-{args.onnx_file}.data")
     onnx.save_model(eval_model,
                     f"eval-{args.onnx_file}",
-                    save_as_external_data=True)
+                    save_as_external_data=True,
+                    location=f"eval-{args.onnx_file}.data")
     onnx.save(optimizer_model, f"optimizer-{args.onnx_file}")
 
 
@@ -1231,7 +1390,10 @@ def main():
     parser.add_argument("--rl",
                         help="Using RL type loss instead of SFT type",
                         action="store_true")
-    parser.add_argument("--sdpo", help="Using SDPO style loss instead of REINFORCE loss for RL mode", action="store_true")
+    parser.add_argument(
+        "--sdpo",
+        help="Using SDPO style loss instead of REINFORCE loss for RL mode",
+        action="store_true")
     parser.add_argument("--beta1",
                         help="beta1 for Adam",
                         default=0.9,
