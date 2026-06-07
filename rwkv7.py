@@ -840,7 +840,7 @@ def make_model_from_state_dict(
     x_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
         "x", onnx.TensorProto.INT64, ["batch", "seq"])
     head_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
-        "head", onnx_main_dtype, ["batch", "seq", vocab_size])
+        "head", onnx.TensorProto.FLOAT, ["batch", "seq", vocab_size])
     state_value_infos: list[onnx.ValueInfoProto] = []
     state_optional_nodes: list[onnx.NodeProto] = [
         onnx.helper.make_node("Shape", ["x"], ["B"], start=0, end=1),
@@ -1050,10 +1050,11 @@ def make_model_from_state_dict(
         "LayerNormalization",
         [f"emb{nlayers - 1}", "ln_out.weight", "ln_out.bias"],
         ["ln_out", "ln_out_mean", "ln_out_invstdev"])
-    head: onnx.NodeProto = onnx.helper.make_node("linear",
+    head: list[onnx.NodeProto] = [onnx.helper.make_node("linear",
                                                  ["ln_out", "head.weight"],
-                                                 ["head"],
-                                                 domain=__domain)
+                                                 ["head_"],
+                                                 domain=__domain),
+                                  onnx.helper.make_node("Cast", ["head_"], ["head"], to=onnx.TensorProto.FLOAT)]
 
     sampling_function: list[onnx.FunctionProto] = []
     if args.sampling or args.sampling_with_head:
@@ -1113,8 +1114,8 @@ def make_model_from_state_dict(
         ]
         sampling_function.append(make_sampling())
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
-            list(parameters.values()) + state_optional_nodes + [emb] + semb +
-            blocks + [ln_out, head] + sampling,
+            list(parameters.values()) + state_optional_nodes +
+            [emb] + semb + blocks + [ln_out] + head + sampling,
             "RWKV7-LM",
             [x_value_info] + state_value_infos + [occurence_value_info],
             y_value_infos + next_value_infos,
@@ -1124,7 +1125,7 @@ def make_model_from_state_dict(
     else:
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
             list(parameters.values()) + state_optional_nodes + [emb] + semb +
-            blocks + [ln_out, head],
+            blocks + [ln_out] + head,
             "RWKV7-LM", [x_value_info] + state_value_infos,
             [head_value_info] + next_value_infos,
             initializer=list(tensor_proto_state_dict.values()) +
