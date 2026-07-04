@@ -20,7 +20,6 @@ def make_fallback(dtype: int, suffix: str) -> onnx.FunctionProto:
     fallback: onnx.NodeProto = onnx.helper.make_node(
         "Expand", ["fallback", "fallback_shape"], ["output"])
     output: onnx.TypeProto = onnx.helper.make_tensor_type_proto(dtype, None)
-    optional: onnx.TypeProto = onnx.helper.make_optional_type_proto(output)
     unwrap_graph: onnx.GraphProto = onnx.helper.make_graph(
         [unwrap], "unwrap_graph", [],
         [onnx.helper.make_value_info("output", output)])
@@ -705,7 +704,9 @@ def make_sampling() -> onnx.FunctionProto:
 
 def make_model_from_state_dict(
         args: argparse.Namespace) -> onnx.ModelProto | dict[onnx.ModelProto]:
-    state_dict: dict[str, torch.Tensor] = torch.load(args.pt_file, "cpu")
+    state_dict: dict[str, torch.Tensor] = torch.load(args.pt_file,
+                                                     "cpu",
+                                                     mmap=True)
     dtype: str = args.dtype
 
     torch_onnx_dtype: dict[torch.dtype, int] = {
@@ -828,8 +829,8 @@ def make_model_from_state_dict(
         if k.startswith("blocks.0.") and (k.endswith("v0") or k.endswith("v1")
                                           or k.endswith("v2")):
             continue
-        tensor: np.ndarray = state_dict[k].detach().cpu().to(
-            torch.float).numpy()
+        tensor: np.ndarray = state_dict[k].to(torch.float).numpy().astype(
+            np_dtype_table[state_dict[k].dtype])
         tensor_proto_state_dict[k] = onnx.numpy_helper.from_array(
             tensor.astype(np_dtype_table[main_dtype]), f"{k}")
         type_proto_state_dict[k] = onnx.helper.make_tensor_value_info(
@@ -1050,11 +1051,12 @@ def make_model_from_state_dict(
         "LayerNormalization",
         [f"emb{nlayers - 1}", "ln_out.weight", "ln_out.bias"],
         ["ln_out", "ln_out_mean", "ln_out_invstdev"])
-    head: list[onnx.NodeProto] = [onnx.helper.make_node("linear",
-                                                 ["ln_out", "head.weight"],
-                                                 ["head_"],
-                                                 domain=__domain),
-                                  onnx.helper.make_node("Cast", ["head_"], ["head"], to=onnx.TensorProto.FLOAT)]
+    head: list[onnx.NodeProto] = [
+        onnx.helper.make_node("linear", ["ln_out", "head.weight"], ["head_"],
+                              domain=__domain),
+        onnx.helper.make_node("Cast", ["head_"], ["head"],
+                              to=onnx.TensorProto.FLOAT)
+    ]
 
     sampling_function: list[onnx.FunctionProto] = []
     if args.sampling or args.sampling_with_head:
@@ -1114,8 +1116,8 @@ def make_model_from_state_dict(
         ]
         sampling_function.append(make_sampling())
         rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
-            list(parameters.values()) + state_optional_nodes +
-            [emb] + semb + blocks + [ln_out] + head + sampling,
+            list(parameters.values()) + state_optional_nodes + [emb] + semb +
+            blocks + [ln_out] + head + sampling,
             "RWKV7-LM",
             [x_value_info] + state_value_infos + [occurence_value_info],
             y_value_infos + next_value_infos,
@@ -1179,8 +1181,6 @@ def generate_training_artifacts(args: argparse.Namespace,
             self.base.graph.initializer.append(
                 onnx.numpy_helper.from_array(
                     np.array([0, -1, 0, 1], dtype=np.int64), "loss_pad"))
-            x_padded: str = self.pad("x", "loss_pad")
-            logit_casted: str = self.cast(logit)
             self.base.graph.initializer.append(
                 onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64),
                                              "x_flatten_shape"))
@@ -1188,9 +1188,17 @@ def generate_training_artifacts(args: argparse.Namespace,
                 onnx.numpy_helper.from_array(
                     np.array([-1, vocab_size], dtype=np.int64),
                     "logit_flatten_shape"))
-            logit_flattened: str = self.reshape(logit_casted,
-                                                "logit_flatten_shape")
+
+            x_padded: str = self.pad("x", "loss_pad")
             x_flattened: str = self.reshape(x_padded, "x_flatten_shape")
+            logit_flattened: str = self.reshape(logit, "logit_flatten_shape")
+
+            # CrossEntropyLoss will use ValueInfo of the logit.
+            self.base.graph.value_info.append(
+                onnx.helper.make_tensor_value_info(logit_flattened,
+                                                   onnx.TensorProto.FLOAT,
+                                                   ["B(T-1)", "V"]))
+
             loss: str = self.loss_fn(logit_flattened, x_flattened)
             mask: str = self.inputlike("mask")
             mask_casted: str = self.cast(mask)
@@ -1233,6 +1241,7 @@ def generate_training_artifacts(args: argparse.Namespace,
             return self.div(rewarded_loss_sum, mask_sum)
 
     class SDPOLoss(onnxblock.TrainingBlock):
+
         def __init__(self):
             super().__init__()
             self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
