@@ -5,8 +5,6 @@ import numpy as np
 import torch
 import argparse
 
-from typing import Any
-
 __domain: str = "rwkv7"
 __opset_imports: list[onnx.OperatorSetIdProto] = [
     onnx.helper.make_opsetid("", 21),
@@ -1149,206 +1147,6 @@ def make_model_from_state_dict(
     return rwkv_lm_model, parameter_names
 
 
-def generate_training_artifacts(args: argparse.Namespace,
-                                parameters: list[str]) -> None:
-    import onnxruntime.training.onnxblock as onnxblock
-    import onnxruntime.training.onnxblock.blocks as blocks
-
-    model: onnx.ModelProto = onnx.load_model(args.onnx_file,
-                                             load_external_data=False)
-    emb_weight: onnx.TensorProto = None
-    vocab_size: int = -1
-    for t in model.graph.initializer:
-        if t.name == "emb.weight":
-            vocab_size = int(t.dims[0])
-    assert vocab_size != -1
-
-    class SFTLoss(onnxblock.TrainingBlock):
-
-        def __init__(self):
-            super().__init__()
-            self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
-            self.cast: onnxblock.Block = blocks.Cast(onnx.TensorProto.FLOAT)
-            self.reshape: onnxblock.Block = blocks._BinaryOp("Reshape")
-            self.loss_fn: onnxblock.Block = onnxblock.loss.CrossEntropyLoss(
-                reduction="none")
-            self.inputlike: onnxblock.Block = blocks.InputLike("x")
-            self.mul: onnxblock.Block = blocks.Mul()
-            self.div: onnxblock.Block = blocks.Div()
-            self.sum: onnxblock.Block = blocks.ReduceSum(keepdims=False)
-
-        def build(self, logit: str) -> str:
-            self.base.graph.initializer.append(
-                onnx.numpy_helper.from_array(
-                    np.array([0, -1, 0, 1], dtype=np.int64), "loss_pad"))
-            self.base.graph.initializer.append(
-                onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64),
-                                             "x_flatten_shape"))
-            self.base.graph.initializer.append(
-                onnx.numpy_helper.from_array(
-                    np.array([-1, vocab_size], dtype=np.int64),
-                    "logit_flatten_shape"))
-
-            x_padded: str = self.pad("x", "loss_pad")
-            x_flattened: str = self.reshape(x_padded, "x_flatten_shape")
-            logit_flattened: str = self.reshape(logit, "logit_flatten_shape")
-
-            # CrossEntropyLoss will use ValueInfo of the logit.
-            self.base.graph.value_info.append(
-                onnx.helper.make_tensor_value_info(logit_flattened,
-                                                   onnx.TensorProto.FLOAT,
-                                                   ["B(T-1)", "V"]))
-
-            loss: str = self.loss_fn(logit_flattened, x_flattened)
-            mask: str = self.inputlike("mask")
-            mask_casted: str = self.cast(mask)
-            mask_flattened: str = self.reshape(mask_casted, "x_flatten_shape")
-            loss_masked: str = self.mul(loss, mask_flattened)
-            loss_masked_sum: str = self.sum(loss_masked)
-            mask_sum: str = self.sum(mask_flattened)
-            return self.div(loss_masked_sum, mask_sum)
-
-    class REINFORCELoss(onnxblock.TrainingBlock):
-
-        def __init__(self):
-            super().__init__()
-            self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
-            self.cast: onnxblock.Block = blocks.Cast(onnx.TensorProto.FLOAT)
-            self.loss_fn: onnxblock.Block = onnxblock.loss.CrossEntropyLoss(
-                reduction="none")
-            self.inputlike: onnxblock.Block = blocks.InputLike("x")
-            self.mul: onnxblock.Block = blocks.Mul()
-            self.div: onnxblock.Block = blocks.Div()
-            self.sum: onnxblock.Block = blocks.ReduceSum(keepdims=False)
-
-        def build(self, logit: str) -> str:
-            self.base.graph.initializer.append(
-                onnx.helper.make_tensor("loss_pad", onnx.TensorProto.INT64,
-                                        [4], [0, 0, -1, 1]))
-            x_padded: str = self.pad("x", "loss_pad")
-            logit_casted: str = self.cast(logit)
-            loss: str = self.loss_fn(logit_casted, x_padded)
-            mask: str = self.inputlike("mask")
-            mask_casted: str = self.cast(mask)
-            loss_masked: str = self.mul(loss, mask_casted)
-            reward: str = self.inputlike("reward")
-            reward_value_info: onnx.ValueInfoProto = self.base.graph.input[-1]
-            assert reward_value_info.name == "reward"
-            reward_value_info.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
-            rewarded_loss: str = self.mul(reward, loss_masked)
-            rewarded_loss_sum: str = self.sum(rewarded_loss)
-            mask_sum: str = self.sum(mask_casted)
-            return self.div(rewarded_loss_sum, mask_sum)
-
-    class SDPOLoss(onnxblock.TrainingBlock):
-
-        def __init__(self):
-            super().__init__()
-            self.pad: onnxblock.Block = blocks._BinaryOp("Pad")
-            self.cast: onnxblock.Block = blocks.Cast(onnx.TensorProto.FLOAT)
-            self.inputlike_x: onnxblock.Block = blocks.InputLike("x")
-            self.inputlike_head: onnxblock.Block = blocks.InputLike("head")
-            self.softmax: onnxblock.Block = blocks._UnaryOp("Softmax")
-            self.unsqueeze: onnxblock.Block = blocks._BinaryOp("Unsqueeze")
-            self.sub: onnxblock.Block = blocks.Sub()
-            self.mul: onnxblock.Block = blocks.Mul()
-            self.div: onnxblock.Block = blocks.Div()
-            self.sum: onnxblock.Block = blocks.ReduceSum(keepdims=False)
-
-        def build(self, logit: str) -> str:
-            logit_casted: str = self.cast(logit)
-            teacher_logit: str = self.cast(
-                self.inputlike_head("teacher_logit"))
-            teacher_logit_casted: str = self.cast(teacher_logit)
-            loss: str = self.mul(self.softmax(logit_casted),
-                                 self.sub(logit_casted, teacher_logit_casted))
-            mask: str = self.inputlike_x("mask")
-            mask_casted_: str = self.cast(mask)
-            mask_casted: str = self.unsqueeze(mask_casted_,
-                                              "[2]")  # (B, T) to (B, T, 1)
-            loss_masked: str = self.mul(loss, mask_casted)
-            loss_sum: str = self.sum(loss_masked)
-            mask_sum: str = self.sum(mask_casted)
-            return self.div(loss_sum, mask_sum)
-
-    loss: onnxblock.TrainingBlock
-    if args.rl:
-        loss = REINFORCELoss()
-    else:
-        loss = SFTLoss()
-    for initializer in model.graph.initializer:
-        name: str = initializer.name
-        loss.requires_grad(name, name in parameters)
-
-    training_model: onnx.ModelProto
-    eval_model: onnx.ModelProto
-    model_params: Any
-    with onnxblock.base(model):
-        _ = loss("head")
-        training_model, eval_model = loss.to_model_proto()
-        model_params = loss.parameters()
-
-    # make initializer for state gradients
-    for k in model.graph.output:
-        tensor_type: onnx.TypeProto.Tensor
-        if k.type.WhichOneof("value") == "optional_type":
-            tensor_type = k.type.optional_type.elem_type.tensor_type
-        else:
-            tensor_type = k.type.tensor_type
-
-        dtype_table: dict[int, np.dtype] = {
-            onnx.TensorProto.FLOAT: np.float32,
-            onnx.TensorProto.FLOAT16: np.float16,
-            onnx.TensorProto.BFLOAT16: ml_dtypes.bfloat16,
-        }
-
-        if k.name.startswith("wkv_next_"):
-            dim: list[int] = [d.dim_value for d in tensor_type.shape.dim]
-            dim[0] = 1  # does need batch size from x?
-            tensor: np.ndarray = np.zeros(dim,
-                                          dtype_table[tensor_type.elem_type])
-            training_model.graph.initializer.append(
-                onnx.numpy_helper.from_array(tensor, k.name + "_grad"))
-
-    # make input order (x, mask, states...) instead of (x, states..., mask)
-    mask_idx: int = None
-    for idx, i in enumerate(training_model.graph.input):
-        if i.name == "mask":
-            mask_idx = idx
-            break
-    assert isinstance(mask_idx, int)
-    input_len: int = len(training_model.graph.input)
-    training_model.graph.input.extend(
-        [training_model.graph.input[0], training_model.graph.input[mask_idx]])
-    training_model.graph.input.extend(training_model.graph.input[1:mask_idx])
-    training_model.graph.input.extend(training_model.graph.input[mask_idx +
-                                                                 1:input_len])
-    del training_model.graph.input[:input_len]
-    assert len(training_model.graph.input) == input_len
-
-    clip_grad: onnxblock.Block = onnxblock.optim.ClipGradNorm(args.clip_grad)
-    optimizer: onnxblock.ForwardBlock = onnxblock.optim.AdamW(
-        betas=[args.beta1, args.beta2],
-        eps=args.adam_eps,
-        weight_decay=0.0,
-        clip_grad=clip_grad)
-    optimizer_model: onnx.ModelProto
-    with onnxblock.empty_base():
-        _ = optimizer(model_params)
-        optimizer_model = optimizer.to_model_proto()
-
-    onnxblock.save_checkpoint(model_params, f"checkpoint-{args.onnx_file}")
-    onnx.save_model(training_model,
-                    f"training-{args.onnx_file}",
-                    save_as_external_data=True,
-                    location=f"training-{args.onnx_file}.data")
-    onnx.save_model(eval_model,
-                    f"eval-{args.onnx_file}",
-                    save_as_external_data=True,
-                    location=f"eval-{args.onnx_file}.data")
-    onnx.save(optimizer_model, f"optimizer-{args.onnx_file}")
-
-
 def main():
     torch.set_default_device("cpu")
 
@@ -1394,32 +1192,6 @@ def main():
                         help="TopP for sampling",
                         default=0.5,
                         type=float)
-    parser.add_argument("--training",
-                        help="Enable generating training artifacts",
-                        action="store_true")
-    parser.add_argument("--rl",
-                        help="Using RL type loss instead of SFT type",
-                        action="store_true")
-    parser.add_argument(
-        "--sdpo",
-        help="Using SDPO style loss instead of REINFORCE loss for RL mode",
-        action="store_true")
-    parser.add_argument("--beta1",
-                        help="beta1 for Adam",
-                        default=0.9,
-                        type=float)
-    parser.add_argument("--beta2",
-                        help="beta2 for Adam",
-                        default=0.99,
-                        type=float)
-    parser.add_argument("--adam_eps",
-                        help="eps for Adam",
-                        default=1e-18,
-                        type=float)
-    parser.add_argument("--clip_grad",
-                        help="gradient clipping",
-                        default=0.1,
-                        type=float)
     parser.add_argument("--partial",
                         help="Export first N layers as the model.",
                         type=int,
@@ -1438,7 +1210,7 @@ def main():
                     args.onnx_file,
                     save_as_external_data=True,
                     location=f"{args.onnx_file}.data")
-    if args.inline or args.training:
+    if args.inline:
         model = onnx.load_model(args.onnx_file, load_external_data=False)
         # Inline rwkv opset functions
         model = onnx.inliner.inline_local_functions(model)
@@ -1451,9 +1223,6 @@ def main():
     onnx.save_model(model, args.onnx_file)
 
     onnx.checker.check_model(args.onnx_file, full_check=True)
-
-    if args.training:
-        generate_training_artifacts(args, parameters)
 
 
 if __name__ == "__main__":

@@ -5,22 +5,31 @@ ONNX-RWKV is a project to make RWKV series ONNX implementation. Since I started 
 ## Supported Data Types
 
 - fp32
+
 - fp16/fp32 mixed
+
 - bf16
 
 ## Supported Models
 
 - RWKV-7
+
 - RWKV-7a (RWKV-7 with DeepEmbed)
 
 ## Supported Sampling Methods
 
 - Presence penalties
+
     - Alpha Presence
+
     - Alpha Frequency
+
     - Alpha Decay
+
 - TopK
+
 - Temperature
+
 - TopP
 
 >
@@ -31,32 +40,29 @@ ONNX-RWKV is a project to make RWKV series ONNX implementation. Since I started 
 > Sampling implementation is almost same as rwkv pip package. However:
 >
 > 1. Alpha presence penalty (occurence in this and the pip package code) is applied to all tokens instead of all tokens except digits and tabs.
+>
 > 2. TopK can be applied because TopK is only way to get sorted logits which is needed to compute TopP.
+>
 > 3. As the rwkv pip package does, temperature is applied after TopK and TopP, not before TopK and TopP.
 >
 
-## Supported Training Methods
+## Supported Training Methods (via `training.py`)
 
 - SFT
-- REINFORCE (token level reward)
-- SDPO (logit distilation)
 
 >
-> Both type receive "mask" INT64 tensor (batch, seq), which is used to mask pad token.
+> Additional model input is presented: "mask" INT64 tensor (batch, seq), which is used to mask pad token.
 >
-> REINFORCE also receives "reward" FLOAT tensor (batch, seq), which is token level reward.
->
-
-To use SFT, just use --training flag.
-To use REINFORCE, specify --training and --rl flags.
 
 >
 > Model generation is done with [my custom onnxruntime](https://github.com/youzow3/onnxruntime). Merge main, controlflow, and transpose_fix.
 >
 
-Training model generation is tested with rwkv7-g1-0.1b, rwkv7-g1c-1.5b, and rwkv7-g1d-2.9b. ~~However, none of them are actually tested with ONNXRuntime Training API to train.~~
+Training model generation is tested with rwkv7-g1g-2.9b.
 
-- SFT method is tested with rwkv7-g1d-0.1b. (Also, REINFORCE and SDPO seems not work in current status)
+### PEFT methods
+
+- LoRA
 
 ## Using models on Chatbot
 
@@ -66,8 +72,13 @@ I tested fp32 RWKV-7 G1 0.1b, and fp32 RWKV-7a G1b 0.1b.
 
 ## NOTE
 
-Implementation problem may still exist.
+`LinearAttention` is presented in Opset27, but it cannot be used because they don't support generalized delta rule. Do I need to open issue?
+
+I don't know, but I think RWKV-8 cannot be implemented in pure-ONNX because of ROSA.
+
+Implementation problem may exist.
 
 ~~Example code in C is available at cli-chat/.~~
 
 The example code still available, but I recommend using Chatbot.
+
