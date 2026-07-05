@@ -55,6 +55,10 @@ ONNX-RWKV is a project to make RWKV series ONNX implementation. Since I started 
 >
 
 >
+> Training model generation can be failed because of Protobuf's file size limit.
+>
+
+>
 > Model generation is done with [my custom onnxruntime](https://github.com/youzow3/onnxruntime). Merge main, controlflow, and transpose_fix.
 >
 
@@ -63,6 +67,8 @@ Training model generation is tested with rwkv7-g1g-2.9b.
 ### PEFT methods
 
 - LoRA
+
+- MiSS
 
 ## Using models on Chatbot
 

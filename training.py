@@ -70,6 +70,7 @@ def main(args: argparse.Namespace) -> int:
     model = onnx.inliner.inline_selected_functions(
         model, [("", "GroupNormalization")], inline_schema_functions=True)
     model_update_needed: bool = False
+    rng: np.random.Generator = np.random.default_rng()
 
     vocab_size: int = -1
     for t in model.graph.initializer:
@@ -99,10 +100,9 @@ def main(args: argparse.Namespace) -> int:
             a, b = initializer.dims
 
             # Append A and B matrix
-            # model.graph.initializer.append()
             A: onnx.TensorProto = onnx.numpy_helper.from_array(
-                np.zeros((a, args.lora_dim),
-                         onnx_np_dtype_table[initializer.data_type]), A_name)
+                rng.normal(0.0, args.lora_sigma, (a, args.lora_dim)).astype(
+                    onnx_np_dtype_table[initializer.data_type]), A_name)
             B: onnx.TensorProto = onnx.numpy_helper.from_array(
                 np.zeros((args.lora_dim, b),
                          onnx_np_dtype_table[initializer.data_type]), B_name)
@@ -116,6 +116,38 @@ def main(args: argparse.Namespace) -> int:
             ]
             loss.requires_grad(A_name)
             loss.requires_grad(B_name)
+        elif args.miss and len(initializer.dims) == 2:
+            model_update_needed = True
+            initializer.name = f"_{name}"
+            m: int = initializer.dims[0]
+            n: int = initializer.dims[1]
+            m_expand: int = m // args.miss_dim
+            n_expand: int = n // args.miss_dim
+            assert m_expand * n_expand * args.miss_dim * args.miss_dim == m * n, f"MiSS cannot be expanded correctly: miss-dim: {args.miss_dim}, target-dim: {m, n}"
+            D: onnx.TensorProto = onnx.numpy_helper.from_array(
+                np.zeros((args.miss_dim, args.miss_dim),
+                         onnx_np_dtype_table[initializer.data_type]),
+                f"_{name}_D")
+            adapter_tensors.append(D)
+            adapter_nodes += [
+                onnx.helper.make_node("Constant", [],
+                                      [f"_{name}_D_expand_shape"],
+                                      value_ints=[
+                                          m_expand * n_expand, args.miss_dim,
+                                          args.miss_dim
+                                      ]),
+                onnx.helper.make_node("Constant", [], [f"_{name}_shape"],
+                                      value_ints=[m, n]),
+                onnx.helper.make_node(
+                    "Expand", [f"_{name}_D", f"_{name}_D_expand_shape"],
+                    [f"_{name}_D_expanded_im"]),
+                onnx.helper.make_node(
+                    "Reshape", [f"_{name}_D_expanded_im", f"_{name}_shape"],
+                    [f"_{name}_D_expanded"]),
+                onnx.helper.make_node("Add",
+                                      [f"_{name}", f"_{name}_D_expanded"],
+                                      [name])
+            ]
         else:
             loss.requires_grad(
                 initializer.name)  # Assume all parameters are trainable
@@ -216,6 +248,15 @@ if __name__ == "__main__":
     parser.add_argument("--lora-dim",
                         help="LoRA dimension",
                         default=8,
+                        type=int)
+    parser.add_argument("--lora-sigma",
+                        help="LoRA initialization parameter",
+                        default=1.0,
+                        type=float)
+    parser.add_argument("--miss", help="Enable MiSS", action="store_true")
+    parser.add_argument("--miss-dim",
+                        help="MiSS dimension",
+                        default=16,
                         type=int)
     parser.add_argument("--beta1",
                         help="beta1 for Adam",

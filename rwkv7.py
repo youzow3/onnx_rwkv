@@ -1078,7 +1078,7 @@ def make_model_from_state_dict(
             onnx.helper.make_optional_type_proto(
                 onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT,
                                                    ["batch", vocab_size])))
-        if args.sampling_with_head or args.training:
+        if args.sampling_with_head:
             y_value_infos.append(head_value_info)
 
         sampling: list[onnx.NodeProto] = [
