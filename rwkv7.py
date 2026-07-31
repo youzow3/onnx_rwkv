@@ -841,6 +841,7 @@ def make_model_from_state_dict(
     head_value_info: onnx.ValueInfoProto = onnx.helper.make_tensor_value_info(
         "head", onnx.TensorProto.FLOAT, ["batch", "seq", vocab_size])
     state_value_infos: list[onnx.ValueInfoProto] = []
+    optional_state_value_infos: list[onnx.ValueInfoProto] = []
     state_optional_nodes: list[onnx.NodeProto] = [
         onnx.helper.make_node("Shape", ["x"], ["B"], start=0, end=1),
         onnx.helper.make_node("Concat", ["B", "1C"], ["B1C"], axis=0),
@@ -855,6 +856,18 @@ def make_model_from_state_dict(
 
     for i in range(nlayers):
         state_value_infos.append(
+            onnx.helper.make_tensor_value_info(f"x_tmix_last_{i}",
+                                               onnx_main_dtype,
+                                               ["batch", 1, dim]))
+        state_value_infos.append(
+            onnx.helper.make_tensor_value_info(
+                f"wkv_state_{i}", onnx_wkv_dtype,
+                ["batch", n_head, head_size, head_size]))
+        state_value_infos.append(
+            onnx.helper.make_tensor_value_info(f"x_cmix_last_{i}",
+                                               onnx_main_dtype,
+                                               ["batch", 1, dim]))
+        optional_state_value_infos.append(
             onnx.helper.make_value_info(
                 f"x_tmix_last_{i}_opt",
                 onnx.helper.make_optional_type_proto(
@@ -871,7 +884,7 @@ def make_model_from_state_dict(
                 [f"x_tmix_last_{i}"],
                 domain=__domain)
         ]
-        state_value_infos.append(
+        optional_state_value_infos.append(
             onnx.helper.make_value_info(
                 f"wkv_state_{i}_opt",
                 onnx.helper.make_optional_type_proto(
@@ -889,7 +902,7 @@ def make_model_from_state_dict(
                 [f"wkv_state_{i}"],
                 domain=__domain)
         ]
-        state_value_infos.append(
+        optional_state_value_infos.append(
             onnx.helper.make_value_info(
                 f"x_cmix_last_{i}_opt",
                 onnx.helper.make_optional_type_proto(
@@ -1056,6 +1069,11 @@ def make_model_from_state_dict(
                               to=onnx.TensorProto.FLOAT)
     ]
 
+    if args.optional_state:
+        state_value_infos = optional_state_value_infos
+    else:
+        state_optional_nodes = []
+
     sampling_function: list[onnx.FunctionProto] = []
     if args.sampling or args.sampling_with_head:
         if args.topk == -1:
@@ -1192,6 +1210,9 @@ def main():
                         help="TopP for sampling",
                         default=0.5,
                         type=float)
+    parser.add_argument("--optional-state",
+                        help="Use optional<tensor> as inputs for state",
+                        action="store_true")
     parser.add_argument("--partial",
                         help="Export first N layers as the model.",
                         type=int,
