@@ -816,8 +816,8 @@ def make_model_from_state_dict(
     ]
 
     # Obtain TensorProtos of parameters
-    tensor_proto_state_dict: dict[str, onnx.TensorProto] = {}
-    type_proto_state_dict: dict[str, onnx.ValueInfoProto] = {}
+    tensor_dict: dict[str, onnx.TensorProto] = {}
+    tensor_value_info_dict: dict[str, onnx.ValueInfoProto] = {}
     parameters: dict[str, onnx.NodeProto] = {}
     parameter_names: list[str] = []
     for k in list(state_dict.keys()):
@@ -829,9 +829,9 @@ def make_model_from_state_dict(
             continue
         tensor: np.ndarray = state_dict[k].to(torch.float).numpy().astype(
             np_dtype_table[state_dict[k].dtype])
-        tensor_proto_state_dict[k] = onnx.numpy_helper.from_array(
+        tensor_dict[k] = onnx.numpy_helper.from_array(
             tensor.astype(np_dtype_table[main_dtype]), f"{k}")
-        type_proto_state_dict[k] = onnx.helper.make_tensor_value_info(
+        tensor_value_info_dict[k] = onnx.helper.make_tensor_value_info(
             k, onnx_dtype_table[main_dtype], tensor.shape)
         parameter_names.append(k)
 
@@ -1075,6 +1075,7 @@ def make_model_from_state_dict(
         state_optional_nodes = []
 
     sampling_function: list[onnx.FunctionProto] = []
+    sampling: list[onnx.NodeProto] = []
     if args.sampling or args.sampling_with_head:
         if args.topk == -1:
             args.topk = vocab_size
@@ -1099,7 +1100,7 @@ def make_model_from_state_dict(
         if args.sampling_with_head:
             y_value_infos.append(head_value_info)
 
-        sampling: list[onnx.NodeProto] = [
+        sampling += [
             onnx.helper.make_node("Constant", [], ["alpha_presence"],
                                   value_float=args.alpha_presence),
             onnx.helper.make_node("Constant", [], ["alpha_frequency"],
@@ -1131,24 +1132,23 @@ def make_model_from_state_dict(
                                   domain=__domain)
         ]
         sampling_function.append(make_sampling())
-        rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
-            list(parameters.values()) + state_optional_nodes + [emb] + semb +
-            blocks + [ln_out] + head + sampling,
-            "RWKV7-LM",
-            [x_value_info] + state_value_infos + [occurence_value_info],
-            y_value_infos + next_value_infos,
-            initializer=list(tensor_proto_state_dict.values()) +
-            state_tensor_proto,
-            value_info=list(type_proto_state_dict.values()))
+
+    model_input: list[onnx.ValueInfoProto] = [x_value_info] + state_value_infos
+    initializer: list[onnx.TensorProto] = []
+    value_info: list[onnx.ValueInfoProto] = []
+    if args.parameter_as_inputs:
+        model_input += list(tensor_value_info_dict.values())
+        initializer += state_tensor_proto
     else:
-        rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
-            list(parameters.values()) + state_optional_nodes + [emb] + semb +
-            blocks + [ln_out] + head,
-            "RWKV7-LM", [x_value_info] + state_value_infos,
-            [head_value_info] + next_value_infos,
-            initializer=list(tensor_proto_state_dict.values()) +
-            state_tensor_proto,
-            value_info=list(type_proto_state_dict.values()))
+        initializer += list(tensor_dict.values()) + state_tensor_proto
+        value_info += list(tensor_value_info_dict.values())
+    rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
+        list(parameters.values()) + state_optional_nodes + [emb] + semb +
+        blocks + [ln_out] + head,
+        "RWKV7-LM",
+        model_input, [head_value_info] + next_value_infos,
+        initializer=initializer,
+        value_info=value_info)
 
     rwkv_lm_model: onnx.ModelProto = onnx.helper.make_model(
         rwkv_lm,
@@ -1212,6 +1212,9 @@ def main():
                         type=float)
     parser.add_argument("--optional-state",
                         help="Use optional<tensor> as inputs for state",
+                        action="store_true")
+    parser.add_argument("--parameter-as-inputs",
+                        help="Treat all parameters as inputs.",
                         action="store_true")
     parser.add_argument("--partial",
                         help="Export first N layers as the model.",
