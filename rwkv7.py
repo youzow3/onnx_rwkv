@@ -1076,6 +1076,7 @@ def make_model_from_state_dict(
 
     sampling_function: list[onnx.FunctionProto] = []
     sampling: list[onnx.NodeProto] = []
+    model_input: list[onnx.ValueInfoProto] = []
     if args.sampling or args.sampling_with_head:
         if args.topk == -1:
             args.topk = vocab_size
@@ -1097,10 +1098,12 @@ def make_model_from_state_dict(
             onnx.helper.make_optional_type_proto(
                 onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT,
                                                    ["batch", vocab_size])))
+        model_input.append(occurence_value_info)
         if args.sampling_with_head:
             y_value_infos.append(head_value_info)
 
         sampling += [
+            onnx.helper.make_node("Shape", ["x"], ["B"], start=0, end=1),
             onnx.helper.make_node("Constant", [], ["alpha_presence"],
                                   value_float=args.alpha_presence),
             onnx.helper.make_node("Constant", [], ["alpha_frequency"],
@@ -1132,8 +1135,10 @@ def make_model_from_state_dict(
                                   domain=__domain)
         ]
         sampling_function.append(make_sampling())
+    else:
+        y_value_infos.append(head_value_info)
 
-    model_input: list[onnx.ValueInfoProto] = [x_value_info] + state_value_infos
+    model_input += [x_value_info] + state_value_infos
     initializer: list[onnx.TensorProto] = []
     value_info: list[onnx.ValueInfoProto] = []
     if args.parameter_as_inputs:
@@ -1144,9 +1149,9 @@ def make_model_from_state_dict(
         value_info += list(tensor_value_info_dict.values())
     rwkv_lm: onnx.GraphProto = onnx.helper.make_graph(
         list(parameters.values()) + state_optional_nodes + [emb] + semb +
-        blocks + [ln_out] + head,
+        blocks + [ln_out] + head + sampling,
         "RWKV7-LM",
-        model_input, [head_value_info] + next_value_infos,
+        model_input, y_value_infos + next_value_infos,
         initializer=initializer,
         value_info=value_info)
 
