@@ -10,6 +10,16 @@ ONNX-RWKV is a project to make RWKV series ONNX implementation. Since I started 
 
 - bf16
 
+- fp16 (`rwkv7_st.py` only)
+
+- bf16-mixed (`rwkv7_st.py` only)
+
+- int8 (`rwkv7_st.py` only)
+
+>
+> int8 is only applied for matrix parameters used with `matmul`.
+>
+
 ## Supported Models
 
 - RWKV-7
@@ -69,6 +79,34 @@ Training model generation is tested with rwkv7-g1g-2.9b.
 - LoRA
 
 - MiSS
+
+## `rwkv7_st.py`
+
+`rwkv7_st.py` is a newer, and improved conversion script. It uses transformers compatible version to generate model file. See [RWKV](https://huggingface.co/RWKV) on HuggingFace.
+
+### Supported Models
+
+- RWKV-7
+
+### Supported Data Types
+
+- fp32
+
+- fp16
+
+- bf16
+
+- fp16 with fp32 state matrix
+
+- bf16 with fp32 state matrix
+
+- fp32/fp16/bf16 with int8 asymmetrically quantized matrix weight
+
+>
+> ***Important Note***
+>
+> Using `bfloat16` needs Opset-28 or higher. Because this script uses Opset-21, you may need some fixes to generate model with bfloat16 data types.
+>
 
 ## Using models on Chatbot
 
