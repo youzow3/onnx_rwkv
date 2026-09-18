@@ -299,9 +299,6 @@ class Model:
         tensors.append(
             onnx.helper.make_tensor("-exp(-0.5)", self.hparam.elem_type, [],
                                     -np.exp(-0.5)))
-        # tensors.append(onnx.helper.make_tensor("INT8_MIN", self.hparam.elem_type, [], self.dtype.type(np.iinfo(np.int8).min)))
-        # tensors.append(onnx.helper.make_tensor("INT8_MAX", self.hparam.elem_type, [], self.dtype.type(np.iinfo(np.int8).max)))
-        # tensors.append(onnx.helper.make_tensor("INT8_RANGE", self.hparam.elem_type, [], self.dtype.type(np.iinfo(np.int8).max - np.iinfo(np.int8).min)))
         tensors.append(
             onnx.helper.make_tensor("INT8_MIN", self.hparam.elem_type, [],
                                     -128.0))
@@ -319,15 +316,10 @@ class Model:
         tensors.append(
             onnx.numpy_helper.from_array(np.array((1, ), dtype=np.int64), "1"))
         tensors.append(
-            onnx.numpy_helper.from_array(np.array((2, ), dtype=np.int64), "2"))
-        tensors.append(
             onnx.numpy_helper.from_array(np.array((3, ), dtype=np.int64), "3"))
         tensors.append(
             onnx.numpy_helper.from_array(np.array((-1, ), dtype=np.int64),
                                          "-1"))
-        tensors.append(
-            onnx.numpy_helper.from_array(
-                np.array((False, True), dtype=np.bool), "(False, True)"))
         tensors.append(
             onnx.numpy_helper.from_array(
                 np.array((0.0, 1.0), dtype=np.float32), "(0.0, 1.0)"))
@@ -430,12 +422,9 @@ class Model:
     # Maybe need to cast `value` to fp32.
     def _normalize(self,
                    value: str,
-                   output_value: Optional[str],
+                   output_value: str,
                    axis: str = "-1",
                    eps: str = "eps") -> List[onnx.NodeProto]:
-        if output_value is None:
-            output_value = f"{value}.normalized"
-
         normalize_nodes: list[onnx.NodeProto] = []
         normalize_nodes.append(
             onnx.helper.make_node("ReduceL2", [value, axis], [f"{value}.l2"]))
@@ -451,11 +440,8 @@ class Model:
     def _linear_transposed(self,
                            x: str,
                            weight: str,
-                           output_value: Optional[str],
+                           output_value: str,
                            auto_quantize: bool = True) -> List[onnx.NodeProto]:
-        if output_value is None:
-            output_value = f"{x}@{weight}.T"
-
         return self._matmul(x,
                             weight,
                             output_value,
@@ -465,13 +451,8 @@ class Model:
     def _time_shift(self,
                     x: str,
                     x_last: str,
-                    shifted_value: Optional[str] = None,
-                    next_value: Optional[str] = None) -> List[onnx.NodeProto]:
-        if shifted_value is None:
-            shifted_value = f"{x}.shifted"
-        if next_value is None:
-            next_value = f"{x}.next"
-
+                    shifted_value: str,
+                    next_value: str) -> List[onnx.NodeProto]:
         time_shift_nodes: list[onnx.NodeProto] = []
         time_shift_nodes.append(
             onnx.helper.make_node("Slice", [x, "0", "-1", "1"],
@@ -510,10 +491,7 @@ class Model:
                  B: str,
                  bias: str | None,
                  f: str,
-                 output_value: Optional[str] = None) -> List[onnx.NodeProto]:
-        if output_value is None:
-            output_value = f"{x}.loramlp.{f}"
-
+                 output_value: str) -> List[onnx.NodeProto]:
         loramlp_nodes: list[onnx.NodeProto] = []
         loramlp_nodes += self._matmul(x,
                                       A,
@@ -582,14 +560,14 @@ class Model:
             wkv_graph_nodes.append(
                 onnx.helper.make_node("Einsum", ["wkv_state", "a"],
                                       ["wkv_state.a"],
-                                      equation="bhij,bhj->bhi"))
+                                      equation="...ij,...j->...i"))
             wkv_graph_nodes.append(
                 onnx.helper.make_node("Einsum", ["wkv_state.a", "b"],
                                       ["wkv_state.a.b"],
-                                      equation="bhi,bhj->bhij"))
+                                      equation="...i,...j->...ij"))
             wkv_graph_nodes.append(
                 onnx.helper.make_node("Einsum", ["v", "k"], ["v.k"],
-                                      equation="bhi,bhj->bhij"))
+                                      equation="...i,...j->...ij"))
             wkv_graph_nodes.append(
                 onnx.helper.make_node("Mul", ["wkv_state", "w"],
                                       ["wkv_state.w"]))
@@ -645,7 +623,7 @@ class Model:
             onnx.helper.make_node("Einsum",
                                   [f"_{output_value}.casted", f"{r}.casted"],
                                   [f"{output_value}.casted"],
-                                  equation="bthij,bthj->bthi"))
+                                  equation="...ij,...j->...i"))
         wkv_nodes.append(
             onnx.helper.make_node("Cast", [f"{output_value}.casted"],
                                   [output_value],
@@ -773,7 +751,7 @@ class Model:
             onnx.helper.make_node("Einsum",
                                   [tn("r.head"), tn("u.k.head")],
                                   [tn("_u.rk.head")],
-                                  equation="bthi,bthi->bth"))
+                                  equation="...i,...i->..."))
         tmix_nodes.append(
             onnx.helper.make_node("Unsqueeze", [tn("_u.rk.head"), "-1"],
                                   [tn("u.rk.head")]))
