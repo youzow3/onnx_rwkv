@@ -7,7 +7,7 @@ import safetensors.numpy as safetensors
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Dict, Optional, List, Set
+from typing import Callable, Dict, List, Set
 
 DTYPE_TABLE: dict[str, np.dtype] = {
     "auto": None,
@@ -152,7 +152,7 @@ class Model:
                     onnx.helper.make_node("Add", [a, f"{a}.population_"],
                                           [f"{a}.population"]))
                 a_merge_then_graph: onnx.GraphProto = onnx.helper.make_graph(
-                    b_merge_then_nodes,
+                    a_merge_then_nodes,
                     f"graph.{hash(a + output_value)}.merge.then", [],
                     a_merge_outputs)
 
@@ -757,11 +757,11 @@ class Model:
             if k == "rwkv7.emb.weight":
                 # Pre compute ln0 layer normalization
                 v = (v - np.mean(v, axis=-1, keepdims=True)) / (
-                    np.sqrt(np.var(v, axis=-1, keepdims=True)) + 1e-5
+                    np.sqrt(np.var(v, axis=-1, keepdims=True) + 1e-5)
                 ) * parameters["rwkv7.blocks.0.ln0.weight"] + parameters[
                     "rwkv7.blocks.0.ln0.bias"]
-            elif k.endswith(".weight") and not k == "rwkv7.emb.weight" and (
-                    len(v.shape) == 2):
+            elif k.endswith(".weight") and (len(v.shape) == 2):
+                print("Transposed ", end="")
                 v = v.T
 
             if self.quant_dtype == np.dtype(np.int8) and len(
@@ -1060,14 +1060,14 @@ class Model:
                     next_value: str) -> List[onnx.NodeProto]:
         time_shift_nodes: list[onnx.NodeProto] = []
         time_shift_nodes.append(
-            onnx.helper.make_node("Slice", [x, "0", "-1", "1"],
+            onnx.helper.make_node("Slice", [x, "0", "-1", "-2"],
                                   [f"{x}.shifted_"]))
         time_shift_nodes.append(
             onnx.helper.make_node("Concat", [x_last, f"{x}.shifted_"],
                                   [shifted_value],
-                                  axis=1))
+                                  axis=-2))
         time_shift_nodes.append(
-            onnx.helper.make_node("Slice", [x, "-1", "INT64_MAX", "1"],
+            onnx.helper.make_node("Slice", [x, "-1", "INT64_MAX", "-2"],
                                   [next_value]))
         return time_shift_nodes
 
@@ -1503,7 +1503,7 @@ class Model:
             tmix_nodes += self._lerp_pre_computed(vn("_v"),
                                                   vn("_v.lerp_pre_compute"),
                                                   vn("vg"), vn("v"))
-            v = vn("_v")
+            v = vn("v")
 
         tmix_nodes.append(
             onnx.helper.make_node("Reshape", [vn("r"), "PBTHN"],
@@ -1548,7 +1548,7 @@ class Model:
             onnx.helper.make_node("Einsum",
                                   [vn("r.head"), vn("u.k.head")],
                                   [vn("_u.rk.head")],
-                                  equation="...i,...i->..."))
+                                  equation="...hi,...hi->...h"))
         tmix_nodes.append(
             onnx.helper.make_node("Unsqueeze", [vn("_u.rk.head"), "-1"],
                                   [vn("u.rk.head")]))

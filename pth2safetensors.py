@@ -4,7 +4,16 @@ import safetensors.torch
 
 
 def main(args: argparse.Namespace):
-    safetensors.torch.save_file(torch.load(args.pth, mmap=True), args.st)
+    t: dict[str, torch.Tensor] = {}
+    for k, v in torch.load(args.pth,
+                           mmap=True,
+                           map_location=torch.device("cpu")).items():
+        if k == "head.weight":
+            t[k] = v
+        else:
+            t[f"rwkv7.{k}"] = v
+
+    safetensors.torch.save_file(t, args.st)
 
 
 if __name__ == "__main__":
