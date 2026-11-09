@@ -760,6 +760,8 @@ class Model:
                     np.sqrt(np.var(v, axis=-1, keepdims=True) + 1e-5)
                 ) * parameters["rwkv7.blocks.0.ln0.weight"] + parameters[
                     "rwkv7.blocks.0.ln0.bias"]
+            elif k.startswith("rwkv7.blocks.0.ln0."):
+                continue  # Skip ln0 parameters
             elif k.endswith(".weight") and (len(v.shape) == 2):
                 print("Transposed ", end="")
                 v = v.T
@@ -2160,7 +2162,16 @@ class Model:
         model_initializer: list[onnx.TensorProto] = []
         model_initializer += self._constants_tensors()
         for k, v in self._cast_parameters(parameters).items():
-            model_initializer.append(onnx.numpy_helper.from_array(v, k))
+            if self.args.parameter_as_inputs:
+                prefixed: str = f"{self.args.parameter_as_inputs_prefix}{k}"
+                model_inputs.append(
+                    onnx.helper.make_tensor_value_info(
+                        prefixed, DTYPE_TO_ELEM_TYPE[v.dtype], v.shape))
+                if k != prefixed:
+                    model_nodes.insert(
+                        0, onnx.helper.make_node("Identity", [prefixed], [k]))
+            else:
+                model_initializer.append(onnx.numpy_helper.from_array(v, k))
         model_graph: onnx.GraphProto = onnx.helper.make_graph(
             model_nodes,
             "RWKV7-LM",
@@ -2218,6 +2229,17 @@ def main() -> int:
         help=
         "Use optional(tensor(dtype)) instead of tensor(dtype) for token shift and state input."
     )
+    parser.add_argument("--parameter-as-inputs",
+                        action="store_true",
+                        help="Treat all parameter as model inputs")
+    parser.add_argument("--parameter-as-inputs-prefix",
+                        default="",
+                        type=str,
+                        help="Input name prefix used for parameters.")
+    parser.add_argument("--convert-safetensors",
+                        default=None,
+                        type=str,
+                        help="Generate safetensors with casted weight data.")
     parser.add_argument(
         "--evolution-strategy",
         action="store_true",
@@ -2244,9 +2266,12 @@ def main() -> int:
         print(f"Safetensor file {args.st_file} is not found: {e}")
         return 1
 
-    model: onnx.ModelProto = Model(
-        args, HyperParameter.from_parameters(parameters)).generate(parameters)
-    onnx.save_model(model,
+    model: Model = Model(args, HyperParameter.from_parameters(parameters))
+    model_proto: onnx.ModelProto = model.generate(parameters)
+    if args.convert_safetensors is not None:
+        safetensors.save_file(model._cast_parameters(parameters),
+                              args.convert_safetensors)
+    onnx.save_model(model_proto,
                     args.onnx_file,
                     save_as_external_data=True,
                     location=f"{args.onnx_file}.data")
