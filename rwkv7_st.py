@@ -1780,7 +1780,9 @@ class Model:
                                   then_branch=self.sampling_then))
         return sampling_nodes
 
-    def generate(self, parameters: Dict[str, np.ndarray]) -> onnx.ModelProto:
+    def generate(
+        self, parameters: Dict[str, np.ndarray]
+    ) -> tuple[onnx.ModelProto, dict[str, np.ndarray]]:
         model_nodes: list[onnx.NodeProto] = []
         model_inputs: list[onnx.ValueInfoProto] = []
         model_outputs: list[onnx.ValueInfoProto] = []
@@ -2161,7 +2163,8 @@ class Model:
 
         model_initializer: list[onnx.TensorProto] = []
         model_initializer += self._constants_tensors()
-        for k, v in self._cast_parameters(parameters).items():
+        parameters = self._cast_parameters(parameters)
+        for k, v in parameters.items():
             if self.args.parameter_as_inputs:
                 prefixed: str = f"{self.args.parameter_as_inputs_prefix}{k}"
                 model_inputs.append(
@@ -2180,7 +2183,7 @@ class Model:
             initializer=model_initializer)
         model: onnx.ModelProto = onnx.helper.make_model(
             model_graph, opset_imports=(onnx.helper.make_opsetid("", 21), ))
-        return model
+        return model, parameters
 
 
 def main() -> int:
@@ -2267,10 +2270,14 @@ def main() -> int:
         return 1
 
     model: Model = Model(args, HyperParameter.from_parameters(parameters))
-    model_proto: onnx.ModelProto = model.generate(parameters)
+    model_proto: onnx.ModelProto
+    model_proto, parameters = model.generate(parameters)
     if args.convert_safetensors is not None:
-        safetensors.save_file(model._cast_parameters(parameters),
-                              args.convert_safetensors)
+        safetensors.save_file(
+            {
+                k: v if v.flags["C_CONTIGUOUS"] else np.ascontiguousarray(v)
+                for k, v in parameters.items()
+            }, args.convert_safetensors)
     onnx.save_model(model_proto,
                     args.onnx_file,
                     save_as_external_data=True,
